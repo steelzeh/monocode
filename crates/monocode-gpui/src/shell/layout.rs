@@ -148,6 +148,11 @@ fn panel_button(enabled: bool, dot: bool) -> gpui::Stateful<gpui::Div> {
 }
 
 impl Shell {
+    /// The rounded layout with its side panels swapped. Only that layout
+    /// supports it: the boxy ones run the traffic lights over the sidebar.
+    pub(super) fn panels_swapped(&self) -> bool {
+        self.workspace.preferences.swap_side_panels && !self.workspace.boxy_layout()
+    }
     pub(super) fn classic_titlebar_spans_window(&self, cx: &gpui::App) -> bool {
         cfg!(target_os = "macos")
             && self.workspace.classic_layout
@@ -263,6 +268,14 @@ impl Shell {
             )
             .child(card_corner_mask(false));
         let footer = self.footer_row(cx);
+        let swapped = self.panels_swapped();
+        let closing_gap = 6. * (1. - self.sidebar_fraction);
+        let rail = self.project_icon_rail(cx);
+        let reserved = sidebar_width.max(if rail.is_some() {
+            super::project_folders::PROJECT_RAIL_WIDTH
+        } else {
+            0.
+        });
         vec![
             div()
                 .h(px(TITLE_BAR_HEIGHT))
@@ -274,7 +287,9 @@ impl Shell {
                 .flex_1()
                 .min_h_0()
                 .flex()
+                .when(swapped, |d| d.flex_row_reverse())
                 .relative()
+                .children(rail)
                 .when(sidebar_width > 0., |d| {
                     d.child(
                         // Keep the sidebar still beneath the moving card. Clip
@@ -284,7 +299,7 @@ impl Shell {
                             .id("sidebar-frame")
                             .debug_selector(|| "sidebar-frame".into())
                             .absolute()
-                            .left_0()
+                            .map(|d| if swapped { d.right_0() } else { d.left_0() })
                             .top_0()
                             .w(px(sidebar_width))
                             .h_full()
@@ -302,7 +317,7 @@ impl Shell {
                             ),
                     )
                 })
-                .child(div().w(px(sidebar_width)).h_full().flex_shrink_0())
+                .child(div().w(px(reserved)).h_full().flex_shrink_0())
                 .child(
                     div()
                         .id("main-pane-frame")
@@ -313,12 +328,17 @@ impl Shell {
                         .h_full()
                         .flex()
                         .flex_col()
-                        .pr_1p5()
-                        .pl(px(6. * (1. - self.sidebar_fraction)))
+                        .map(|d| {
+                            if swapped {
+                                d.pl_1p5().pr(px(closing_gap))
+                            } else {
+                                d.pr_1p5().pl(px(closing_gap))
+                            }
+                        })
                         .child(
                             div()
                                 .absolute()
-                                .right_0()
+                                .map(|d| if swapped { d.left_0() } else { d.right_0() })
                                 .top_0()
                                 .bottom_0()
                                 .w(px(6.))
@@ -328,10 +348,10 @@ impl Shell {
                             d.child(
                                 div()
                                     .absolute()
-                                    .left_0()
+                                    .map(|d| if swapped { d.right_0() } else { d.left_0() })
                                     .top_0()
                                     .bottom_0()
-                                    .w(px(6. * (1. - self.sidebar_fraction)))
+                                    .w(px(closing_gap))
                                     .bg(inset_chrome_wash()),
                             )
                         })
@@ -591,6 +611,17 @@ impl Shell {
                 ),
             );
         }
+        if self.tweak_tab_shown(cx) {
+            tabs.push((
+                "right-panel-tweaks",
+                "Tweaks",
+                self.right_panel.as_ref().map_or_else(
+                    || crate::tweaks::tab_icon(None, cx),
+                    |panel| panel.read(cx).tweak_tab_icon(cx),
+                ),
+                RightTab::Tweaks,
+            ));
+        }
         let count = tabs.len();
         row.pl_1p5()
             .pr(px(12. + self.window_controls))
@@ -616,6 +647,10 @@ impl Shell {
                                     _ if selected => 1.,
                                     _ => 0.,
                                 };
+                                let label = self.right_panel.as_ref().map_or_else(
+                                    || gpui::SharedString::from(label),
+                                    |panel| panel.read(cx).tab_title(tab, cx),
+                                );
                                 tab_button(
                                     id,
                                     crate::project_tabs::TabLabel::from(label).max_width(
@@ -695,7 +730,13 @@ impl Shell {
             div()
                 .id("sidebar-resize")
                 .absolute()
-                .left(px(border - 2.))
+                .map(|d| {
+                    if self.panels_swapped() {
+                        d.right(px(border - 2.))
+                    } else {
+                        d.left(px(border - 2.))
+                    }
+                })
                 .w(px(4.))
                 .h_full()
                 .cursor(CursorStyle::ResizeLeftRight)
@@ -745,6 +786,7 @@ impl Shell {
             .min_h_0()
             .overflow_hidden()
             .flex()
+            .when(self.panels_swapped(), |d| d.flex_row_reverse())
             .child(self.background_card.probe())
             .child(
                 div().flex_1().min_w_0().h_full().flex().flex_col().child(
@@ -1009,6 +1051,271 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn swapped_window(cx: &mut TestAppContext) -> WindowHandle<Shell> {
+        // Panels land at once, so positions are their final ones.
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let (window, _, _) = super::super::tests::window(cx);
+        cx.simulate_window_resize(window.into(), gpui::size(px(1400.), px(900.)));
+        window
+            .update(cx, |shell, w, cx| {
+                shell.workspace.preferences.swap_side_panels = true;
+                shell.workspace.sidebar_visible = true;
+                if !shell.workspace.right_panel_open {
+                    shell.toggle_right_panel(w, cx);
+                }
+                shell.layout_changed(cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+    }
+
+    #[gpui::test]
+    fn swapped_panels_put_the_sidebar_right_and_the_explorer_left(cx: &mut TestAppContext) {
+        let window = swapped_window(cx);
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.run_until_parked();
+        let sidebar = visual.debug_bounds("sidebar-frame").unwrap();
+        let main = visual.debug_bounds("main-pane-frame").unwrap();
+        assert!(main.right() <= sidebar.left() + px(1.));
+        assert_eq!(sidebar.right(), px(1400.));
+        let panel = visual.debug_bounds("right-panel-frame").unwrap();
+        assert!(panel.left() <= main.left() + px(20.));
+        assert!(panel.right() < main.center().x);
+        // Its tabs head the panel, clear of the traffic lights in the title bar.
+        let tabs = visual.debug_bounds("right-panel-inline-tabs").unwrap();
+        assert!(tabs.top() >= panel.top() && tabs.bottom() <= panel.bottom());
+    }
+
+    #[gpui::test]
+    fn swapped_resize_handles_grow_toward_the_middle(cx: &mut TestAppContext) {
+        let window = swapped_window(cx);
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.run_until_parked();
+        let widths = |visual: &mut gpui::VisualTestContext| {
+            window
+                .update(visual, |shell, _, _| {
+                    (
+                        shell.workspace.sidebar_width,
+                        shell.workspace.right_panel_width,
+                    )
+                })
+                .unwrap()
+        };
+        let (sidebar, panel) = widths(visual);
+        // The sidebar's inner edge is its left one: moving left widens it.
+        let edge = visual.debug_bounds("sidebar-frame").unwrap().left();
+        let y = px(500.);
+        visual.simulate_mouse_down(gpui::point(edge, y), MouseButton::Left, Default::default());
+        visual.simulate_mouse_move(
+            gpui::point(edge - px(40.), y),
+            MouseButton::Left,
+            Default::default(),
+        );
+        visual.simulate_mouse_up(
+            gpui::point(edge - px(40.), y),
+            MouseButton::Left,
+            Default::default(),
+        );
+        visual.run_until_parked();
+        assert_eq!(widths(visual).0, sidebar + 40.);
+        // The panel's inner edge is its right one: moving right widens it.
+        let edge = visual.debug_bounds("right-panel-frame").unwrap().right();
+        visual.simulate_mouse_down(gpui::point(edge, y), MouseButton::Left, Default::default());
+        visual.simulate_mouse_move(
+            gpui::point(edge + px(30.), y),
+            MouseButton::Left,
+            Default::default(),
+        );
+        visual.simulate_mouse_up(
+            gpui::point(edge + px(30.), y),
+            MouseButton::Left,
+            Default::default(),
+        );
+        visual.run_until_parked();
+        // Swapped, the panel starts at no less than its 328px floor.
+        assert_eq!(widths(visual).1, panel.max(328.) + 30.);
+    }
+
+    #[gpui::test]
+    fn swapped_files_open_left_of_the_chat_and_their_edge_drags_right(cx: &mut TestAppContext) {
+        // The handle appears once the file has finished sliding open.
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let window = swapped_window(cx);
+        let session = window
+            .update(cx, |shell, w, cx| {
+                shell.open_review(
+                    crate::review::ReviewTab::File {
+                        cwd: shell.workspace.project.clone(),
+                        path: "/tmp/swapped-file.rs".into(),
+                    },
+                    w,
+                    cx,
+                );
+                shell.workspace.active.unwrap()
+            })
+            .unwrap();
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.run_until_parked();
+        let file = visual.debug_bounds("review-frame").unwrap();
+        let grip = visual
+            .debug_bounds(Box::leak(
+                format!("drag-session-pane-{session}").into_boxed_str(),
+            ))
+            .unwrap();
+        assert!(file.right() <= grip.left(), "the chat is right of the file");
+        let ratio = |visual: &mut gpui::VisualTestContext| {
+            window
+                .update(visual, |shell, _, cx| {
+                    shell.active_review(cx).unwrap().read(cx).state.ratio
+                })
+                .unwrap()
+        };
+        let before = ratio(visual);
+        let edge = gpui::point(file.right(), file.center().y);
+        visual.simulate_mouse_down(edge, MouseButton::Left, Default::default());
+        let end = edge + gpui::point(px(60.), px(0.));
+        visual.simulate_mouse_move(end, MouseButton::Left, Default::default());
+        visual.simulate_mouse_up(end, MouseButton::Left, Default::default());
+        visual.run_until_parked();
+        assert!(ratio(visual) > before, "dragging right widens the file");
+    }
+
+    #[gpui::test]
+    fn the_appearance_switch_swaps_the_panels_and_is_saved(cx: &mut TestAppContext) {
+        let window = swapped_window(cx);
+        // The Layout group is at the bottom of a page that would scroll.
+        cx.simulate_window_resize(window.into(), gpui::size(px(1400.), px(2600.)));
+        window
+            .update(cx, |shell, w, cx| {
+                shell.workspace.preferences.swap_side_panels = false;
+                shell.open_settings(crate::settings::Section::Appearance, w, cx);
+            })
+            .unwrap();
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.run_until_parked();
+        let toggle = visual
+            .debug_bounds("settings-toggle-swap-side-panels")
+            .expect("Appearance lists the switch");
+        visual.simulate_click(toggle.center(), Default::default());
+        visual.run_until_parked();
+        window
+            .update(visual, |shell, w, cx| {
+                assert!(shell.panels_swapped());
+                shell.close_settings(w, cx);
+                let saved = shell.latest_state.lock().unwrap().clone();
+                let restored = crate::workspace::Workspace::restore(
+                    Some(&saved),
+                    &[],
+                    &shell.workspace.project,
+                );
+                assert!(restored.preferences.swap_side_panels);
+            })
+            .unwrap();
+        visual.run_until_parked();
+        let sidebar = visual.debug_bounds("sidebar-frame").unwrap();
+        let main = visual.debug_bounds("main-pane-frame").unwrap();
+        assert!(main.right() <= sidebar.left() + px(1.));
+    }
+
+    #[gpui::test]
+    fn swapped_tabs_are_one_named_row_and_explorer_drops_its_header(cx: &mut TestAppContext) {
+        let window = swapped_window(cx);
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.run_until_parked();
+        let order = [
+            "right-panel-tab-Explorer",
+            "right-panel-tab-History",
+            "right-panel-diff-stat",
+            "right-panel-tab-Search",
+        ]
+        .map(|name| visual.debug_bounds(name).unwrap());
+        for pair in order.windows(2) {
+            assert!(
+                pair[0].right() <= pair[1].left() + px(0.5),
+                "{:?} overlaps {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+        // Every tab shows its name, not just the selected one.
+        for tab in [order[0], order[1], order[3]] {
+            assert!(tab.size.width > px(50.), "{:?}", tab.size);
+        }
+        let panel = visual.debug_bounds("right-panel-frame").unwrap();
+        assert!(order[3].right() <= panel.right());
+        assert!(visual.debug_bounds("explorer-new-file").is_none());
+        assert!(visual.debug_bounds("explorer-collapse").is_none());
+        // The stat left the title bar's far corner with the panel open.
+        let stat = order[2];
+        assert!(stat.top() >= panel.top());
+        visual.simulate_click(order[3].center(), Default::default());
+        visual.run_until_parked();
+        window
+            .update(visual, |shell, _, cx| {
+                let panel = shell.right_panel.as_ref().unwrap().read(cx);
+                assert!(panel.explorer.read(cx).search_open());
+            })
+            .unwrap();
+        visual.simulate_click(order[0].center(), Default::default());
+        visual.run_until_parked();
+        window
+            .update(visual, |shell, _, cx| {
+                let panel = shell.right_panel.as_ref().unwrap().read(cx);
+                assert!(!panel.explorer.read(cx).search_open());
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn each_collapse_button_closes_the_panel_on_its_own_side(cx: &mut TestAppContext) {
+        let window = swapped_window(cx);
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.run_until_parked();
+        let left = visual.debug_bounds("toggle-right-panel").unwrap();
+        let right = visual.debug_bounds("toggle-sidebar").unwrap();
+        assert!(
+            left.right() < px(300.),
+            "the Explorer's button is on the left"
+        );
+        assert!(
+            right.left() > px(1200.),
+            "the sidebar's button is on the right"
+        );
+        visual.simulate_click(left.center(), Default::default());
+        visual.run_until_parked();
+        window
+            .update(visual, |shell, _, _| {
+                assert!(!shell.workspace.right_panel_open);
+                assert!(shell.workspace.sidebar_visible);
+            })
+            .unwrap();
+        visual.simulate_click(right.center(), Default::default());
+        visual.run_until_parked();
+        window
+            .update(visual, |shell, _, _| {
+                assert!(!shell.workspace.sidebar_visible)
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn a_boxy_workspace_ignores_the_swap(cx: &mut TestAppContext) {
+        let window = swapped_window(cx);
+        window
+            .update(cx, |shell, _, cx| {
+                shell.workspace.new_layout_boxy = true;
+                shell.layout_changed(cx);
+                assert!(!shell.panels_swapped());
+            })
+            .unwrap();
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.run_until_parked();
+        let sidebar = visual.debug_bounds("sidebar-frame").unwrap();
+        let main = visual.debug_bounds("main-pane-frame").unwrap();
+        assert!(sidebar.right() <= main.left() + px(1.));
     }
 
     #[gpui::test]

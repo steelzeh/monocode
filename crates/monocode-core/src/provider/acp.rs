@@ -107,6 +107,13 @@ impl Protocol {
         ) {
             list.push(app);
         }
+        if let (Some(list), Some(chat), false) = (
+            servers.as_array_mut(),
+            crate::mono::bridge::chat_acp_server(settings.mono.as_ref(), &settings.environment),
+            settings.text_only,
+        ) {
+            list.push(chat);
+        }
         servers
     }
     pub(super) fn acp_cancel(&mut self, stdin: &mut impl Write) -> Result<(), String> {

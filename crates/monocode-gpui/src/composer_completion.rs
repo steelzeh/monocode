@@ -56,6 +56,8 @@ impl Choice {
                 return (
                     if self.insertion.starts_with("@note/") {
                         "note"
+                    } else if self.insertion.starts_with("@chat/") {
+                        "message-square"
                     } else {
                         "sparkles"
                     },
@@ -71,9 +73,42 @@ impl Choice {
         (path, color)
     }
 }
+/// Another chat the user can mention, to link it with this one.
+#[derive(Clone)]
+struct ChatChoice {
+    mention: String,
+    title: String,
+    project: String,
+}
+/// The chats a message can mention, newest first: not this chat, and no
+/// archived chats or chats on another machine.
+fn linkable_chats(store: &monocode_core::store::Store, own: Option<i64>) -> Vec<ChatChoice> {
+    store
+        .sessions()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|chat| Some(chat.id) != own && !chat.archived && !chat.cwd.starts_with("remote://"))
+        .take(300)
+        .map(|chat| {
+            let title =
+                monocode_core::session_title::display_title(&chat.title, &chat.provider).to_owned();
+            ChatChoice {
+                mention: monocode_core::chat_links::mention(chat.id, &title),
+                title,
+                project: std::path::Path::new(&chat.cwd)
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+            }
+        })
+        .collect()
+}
 pub(crate) struct Completion {
     input: Entity<input::Input>,
     store: Option<crate::runtime::Database>,
+    /// The chat this message box belongs to. It cannot mention itself.
+    session: Option<i64>,
+    chats: Vec<ChatChoice>,
     notes: Vec<monocode_core::notes::Note>,
     cwd: String,
     token: Option<Token>,
@@ -81,6 +116,8 @@ pub(crate) struct Completion {
     skills: Vec<DiscoveredSkill>,
     provider: monocode_core::provider::Kind,
     native_commands: Vec<monocode_core::provider::NativeCommand>,
+    /// Slash commands from enabled tweaks: name, description.
+    tweak_commands: Vec<(String, String)>,
     native_loading: bool,
     native_revision: usize,
     mcp: Vec<monocode_core::mcp::McpConnection>,
@@ -141,6 +178,8 @@ impl Completion {
         Self {
             input,
             store: None,
+            session: None,
+            chats: Vec::new(),
             notes: Vec::new(),
             cwd,
             token: None,
@@ -148,6 +187,7 @@ impl Completion {
             skills: Vec::new(),
             provider: monocode_core::provider::Kind::Codex,
             native_commands: Vec::new(),
+            tweak_commands: Vec::new(),
             native_loading: false,
             native_revision: 0,
             mcp: Vec::new(),
@@ -189,6 +229,14 @@ impl Completion {
         self.store = Some(store);
         self
     }
+    pub(crate) fn for_session(mut self, id: i64) -> Self {
+        self.session = Some(id);
+        self
+    }
+    /// Colors a token that was written for the user, such as a dropped chat.
+    pub(crate) fn know_token(&mut self, token: String) {
+        self.known.insert(token);
+    }
     /// Growing document fields anchor suggestions beside the visible caret.
     pub(crate) fn inline_field(mut self) -> Self {
         self.inline_field = true;
@@ -197,6 +245,10 @@ impl Completion {
     /// Keep composer suggestions inside the conversation, below its tabs.
     pub(crate) fn container_probe(&self) -> impl IntoElement {
         self.container_anchor.layout_probe()
+    }
+    /// Where the message box is on screen, once it was drawn.
+    pub(crate) fn composer_bounds(&self) -> Option<gpui::Bounds<gpui::Pixels>> {
+        self.composer_anchor.get()
     }
     pub(crate) fn composer_probe(&self) -> impl IntoElement {
         // Include the composer's 1px border instead of measuring its padded
@@ -223,6 +275,7 @@ impl Completion {
         self.files.clear();
         self.short_mentions.clear();
         self.notes.clear();
+        self.chats.clear();
         self.known = [
             "/plan",
             "/operator",
@@ -368,6 +421,10 @@ impl Completion {
             full
         }
     }
+    #[cfg(test)]
+    pub(crate) fn add_short_mention_for_test(&mut self, short: &str, full: &str) {
+        self.short_mentions.insert(short.into(), full.into());
+    }
     /// Short `@name` labels back to the project-relative paths the prompt
     /// resolves.
     pub(crate) fn expand_mentions(&self, text: &str) -> String {
@@ -388,6 +445,7 @@ impl Completion {
         cx.notify();
     }
     fn sync(&mut self, cx: &mut Context<Self>) {
+        self.tweak_commands = crate::tweaks::commands(cx);
         if self.cwd.starts_with("remote://") {
             self.choices.clear();
             self.token = None;
@@ -502,12 +560,16 @@ impl Completion {
         let generation = self.generation;
         let disabled = self.disabled_paths.clone();
         let store = self.store.clone();
+        let session = self.session;
         let work = cx.background_executor().spawn(async move {
-            let notes = store
+            let (notes, chats) = store
                 .and_then(|s| {
-                    crate::runtime::locked(&s)
-                        .ok()
-                        .and_then(|s| s.list_notes().ok())
+                    crate::runtime::locked(&s).ok().map(|s| {
+                        (
+                            s.list_notes().unwrap_or_default(),
+                            linkable_chats(&s, session),
+                        )
+                    })
                 })
                 .unwrap_or_default();
             let skills =
@@ -515,10 +577,10 @@ impl Completion {
             let files =
                 monocode_core::files::list_project_files_sync_cancellable(&cwd, Some(&cancel));
             let mcp = monocode_core::mcp::mcp_discover(cwd).unwrap_or_default();
-            (skills, files, notes, mcp)
+            (skills, files, notes, chats, mcp)
         });
         cx.spawn(async move |this, cx| {
-            let (skills, files, notes, mcp) = work.await;
+            let (skills, files, notes, chats, mcp) = work.await;
             let _ = this.update(cx, |this, cx| {
                 if generation != this.generation {
                     return;
@@ -528,6 +590,7 @@ impl Completion {
                 this.skills = skills;
                 this.mcp = mcp;
                 this.notes = notes;
+                this.chats = chats;
                 match files {
                     Ok(files) => this.files = files,
                     Err(error) => this.error = Some(error),
@@ -560,6 +623,14 @@ impl Completion {
                 )
                 .chain(this.short_mentions.keys().cloned())
                 .chain(this.notes.iter().map(|n| format!("@note/{}", n.slug)))
+                .chain(this.chats.iter().map(|chat| chat.mention.clone()))
+                // A dropped chat is known before the lists are loaded.
+                .chain(
+                    this.known
+                        .iter()
+                        .filter(|token| token.starts_with("@chat/"))
+                        .cloned(),
+                )
                 .collect();
                 this.highlight(cx);
                 this.rank();
@@ -567,6 +638,60 @@ impl Completion {
             });
         })
         .detach();
+    }
+    /// Adds the chats that fit `query` to the `@` list. A chat goes above the
+    /// files only when it fits at least as well as the best file, and after
+    /// `@chat/` the chats always go first. Chats are in order of last use.
+    fn rank_chats(&mut self, query: &str) {
+        let only_chats = query.starts_with("chat/");
+        let query = query.strip_prefix("chat/").unwrap_or(query);
+        let choice = |chat: &ChatChoice| Choice {
+            label: chat.title.clone(),
+            detail: if chat.project.is_empty() {
+                "Chat".into()
+            } else {
+                format!("Chat · {}", chat.project)
+            },
+            insertion: chat.mention.clone(),
+            builtin: None,
+            mode: None,
+            file: false,
+            server: None,
+        };
+        if query.is_empty() {
+            let recent = self.chats.iter().take(if only_chats { 12 } else { 3 });
+            let recent: Vec<_> = recent.map(choice).collect();
+            self.choices.splice(0..0, recent);
+            return;
+        }
+        let best_file = self
+            .choices
+            .first()
+            .and_then(|first| composer::score(query, &first.label));
+        let mut scored: Vec<_> = self
+            .chats
+            .iter()
+            .enumerate()
+            .filter_map(|(order, chat)| {
+                composer::score(query, &chat.title)
+                    .or_else(|| composer::score(query, &chat.mention))
+                    .map(|score| (score, order, chat))
+            })
+            .collect();
+        scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        let (above, below): (Vec<_>, Vec<_>) = scored
+            .into_iter()
+            .take(8)
+            .partition(|(score, _, _)| only_chats || best_file.is_none_or(|file| *score >= file));
+        let above: Vec<_> = above
+            .iter()
+            .take(if only_chats { 8 } else { 3 })
+            .map(|(_, _, chat)| choice(chat))
+            .collect();
+        self.choices.splice(0..0, above);
+        // The chats that fit less well than a file follow the notes.
+        self.choices
+            .extend(below.iter().map(|(_, _, chat)| choice(chat)));
     }
     fn highlight(&self, cx: &mut Context<Self>) {
         let ranges = composer::highlight_ranges(&self.input.read(cx).content, &self.known);
@@ -659,6 +784,8 @@ impl Completion {
                     file: false,
                     server: None,
                 }));
+            let query = token.query.clone();
+            self.rank_chats(&query);
         } else {
             let mut choices = Vec::new();
             for (order, (id, label, detail)) in [
@@ -741,6 +868,25 @@ impl Completion {
                                 "compact" | "btw" | "stage" | "commit" | "visualize"
                             ))
                             .then_some(id),
+                            file: false,
+                            server: None,
+                        },
+                    ));
+                }
+            }
+            for (name, description) in &self.tweak_commands {
+                if !self.has_user_command(name)
+                    && let Some(score) =
+                        composer::score(&token.query, &format!("{name} {description}"))
+                {
+                    choices.push((
+                        score,
+                        Choice {
+                            label: name.clone(),
+                            detail: description.clone(),
+                            insertion: format!("/{name}"),
+                            builtin: None,
+                            mode: None,
                             file: false,
                             server: None,
                         },
@@ -1465,6 +1611,64 @@ mod tests {
                     v.expand_mentions("see @README.md and @src/mod.rs\n> @README.md"),
                     "see @app/apps/README.md and @src/mod.rs\n> @README.md"
                 );
+            })
+            .unwrap();
+    }
+    #[gpui::test]
+    fn chats_join_the_mention_list_and_a_better_file_stays_first(cx: &mut TestAppContext) {
+        let window = window(cx);
+        window
+            .update(cx, |v, _, _| {
+                let chat = |id: i64, title: &str| ChatChoice {
+                    mention: monocode_core::chat_links::mention(id, title),
+                    title: title.into(),
+                    project: "api".into(),
+                };
+                // Newest first, as the store lists them.
+                v.chats = vec![
+                    chat(3, "Run the tests"),
+                    chat(4, "Billing fix"),
+                    chat(5, "Readme rewrite"),
+                    chat(6, "Older chat"),
+                ];
+                let file = Choice {
+                    label: "README.md".into(),
+                    detail: "README.md".into(),
+                    insertion: "@README.md".into(),
+                    builtin: None,
+                    mode: None,
+                    file: true,
+                    server: None,
+                };
+                let labels = |v: &mut Completion, query: &str| {
+                    v.choices = vec![file.clone()];
+                    v.rank_chats(query);
+                    v.choices
+                        .iter()
+                        .map(|choice| choice.label.clone())
+                        .collect::<Vec<_>>()
+                };
+                // A bare "@" offers the 3 newest chats first.
+                assert_eq!(
+                    labels(v, ""),
+                    [
+                        "Run the tests",
+                        "Billing fix",
+                        "Readme rewrite",
+                        "README.md"
+                    ]
+                );
+                assert_eq!(v.choices[0].insertion, "@chat/run-the-tests-3");
+                assert_eq!(v.choices[0].detail, "Chat · api");
+                assert_eq!(v.choices[0].icon().0, "message-square");
+                // The file fits "readme" better than the chat title does.
+                assert_eq!(labels(v, "readme"), ["README.md", "Readme rewrite"]);
+                assert_eq!(labels(v, "bill"), ["Billing fix", "README.md"]);
+                // After "@chat/" the chats go first. A file in a folder named
+                // "chat" stays in the list.
+                assert_eq!(labels(v, "chat/tests"), ["Run the tests", "README.md"]);
+                assert_eq!(labels(v, "chat/").len(), 5);
+                assert_eq!(labels(v, "chat/").last().unwrap(), "README.md");
             })
             .unwrap();
     }

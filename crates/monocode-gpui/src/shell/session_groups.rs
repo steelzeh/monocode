@@ -84,6 +84,8 @@ pub(super) fn reminder_caption(ms: u64) -> String {
 pub(super) enum ListDrop {
     Folder(String),
     Session(i64),
+    /// Another project in the project list: the chat moves there.
+    Project(String),
 }
 pub(super) struct FolderDrag {
     id: String,
@@ -184,6 +186,11 @@ impl Shell {
         source: i64,
         cx: &App,
     ) -> Option<ListDrop> {
+        // Session folders are not shown in the project list, so a drop there
+        // moves the chat to another project instead.
+        if self.project_list_showing() {
+            return self.project_drop_at(position, source, cx);
+        }
         if !self.workspace.sidebar_visible || self.reminders.iter().any(|r| r.session_id == source)
         {
             return None;
@@ -225,6 +232,7 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         match target {
+            ListDrop::Project(path) => self.move_chats_to_project(&[source], &path, window, cx),
             ListDrop::Folder(folder) => {
                 self.update_groups(cx, |g| g.add_to_folder(&folder, source))
             }
@@ -343,6 +351,9 @@ impl Shell {
     /// The sessions in the order the sidebar shows them, for stepping.
     pub(super) fn sidebar_navigation_ids(&self, cx: &App) -> Vec<i64> {
         let ids = self.sidebar_session_ids(cx);
+        if self.project_list_showing() {
+            return ids;
+        }
         let groups = self.project_groups();
         let entries: Vec<_> = self
             .session_entries(&ids, cx)
@@ -361,7 +372,7 @@ impl Shell {
         navigation_ids(&entries, !self.query.is_empty())
     }
 
-    fn session_menu_ids(&self, id: i64, cx: &App) -> Vec<i64> {
+    pub(super) fn session_menu_ids(&self, id: i64, cx: &App) -> Vec<i64> {
         if !self.selected_sessions.contains(&id) {
             return vec![id];
         }
@@ -441,8 +452,11 @@ impl Shell {
         }
         items.push(MenuAction::new("pin", if all_pinned { "Unpin" } else { "Pin" }).into());
         if !multiple {
+            items.extend([MenuAction::new("rename", "Rename").shortcut("F2").into()]);
+            if let Some(ready) = self.can_fork(id, cx) {
+                items.push(MenuAction::new("fork", "Fork chat").disabled(!ready).into());
+            }
             items.extend([
-                MenuAction::new("rename", "Rename").shortcut("F2").into(),
                 MenuAction::new("copy-session-id", "Copy session ID")
                     .submenu(vec![
                         MenuAction::new("copy-harness-session-id", "Harness session ID")
@@ -461,19 +475,23 @@ impl Shell {
                 .into(),
             ]);
         }
-        items.extend([
-            MenuAction::new("reminder", "Remind me")
-                .submenu(
-                    reminder_presets(Local::now().naive_local())
-                        .into_iter()
-                        .map(|(id, label, enabled)| MenuAction::new(id, label).disabled(!enabled))
-                        .collect(),
-                )
-                .into(),
-            MenuItem::Separator,
-            MenuAction::new("folder-new", "New folder").into(),
-        ]);
-        if !groups.folders.is_empty() {
+        items.extend([MenuAction::new("reminder", "Remind me")
+            .submenu(
+                reminder_presets(Local::now().naive_local())
+                    .into_iter()
+                    .map(|(id, label, enabled)| MenuAction::new(id, label).disabled(!enabled))
+                    .collect(),
+            )
+            .into()]);
+        // Folders belong to one project and the project list does not show them.
+        let folders = !self.project_list_showing();
+        if folders {
+            items.extend::<[MenuItem; 2]>([
+                MenuItem::Separator,
+                MenuAction::new("folder-new", "New folder").into(),
+            ]);
+        }
+        if folders && !groups.folders.is_empty() {
             items.push(MenuItem::Separator);
             items.extend(groups.folders.iter().map(|folder| {
                 MenuAction::new(
@@ -484,7 +502,7 @@ impl Shell {
                 .into()
             }));
         }
-        if ids.iter().any(|id| groups.folder_of(*id).is_some()) {
+        if folders && ids.iter().any(|id| groups.folder_of(*id).is_some()) {
             items.push(
                 MenuAction::new(
                     "folder-remove",
@@ -497,6 +515,21 @@ impl Shell {
                 .into(),
             );
         }
+        if !multiple && id >= 0 {
+            let tweak_items = crate::tweaks::menu_items(cx);
+            if !tweak_items.is_empty() {
+                let busy = self.session_metadata(id, cx).busy;
+                items.push(MenuItem::Separator);
+                items.extend(tweak_items.into_iter().map(|item| {
+                    let working = self.tweak_working_on(id, &item.tweak);
+                    let label = item.busy_label.filter(|_| working).unwrap_or(item.label);
+                    MenuAction::new(item.key, label)
+                        .disabled(working || (item.needs_idle && busy))
+                        .into()
+                }));
+            }
+        }
+        items.extend(self.move_to_project_items(id, cx));
         items.extend([
             MenuItem::Separator,
             MenuAction::new(
@@ -523,6 +556,9 @@ impl Shell {
         }
         let summary = self.session_metadata(id, cx).summary.clone();
         let ids = self.session_menu_ids(id, cx);
+        if let Some(path) = action.strip_prefix(super::move_chat::MOVE_TO_PROJECT) {
+            return self.move_chats_to_project(&ids, path, window, cx);
+        }
         match action {
             "copy-harness-session-id" | "copy-monocode-session-id" => {
                 let text = if action == "copy-harness-session-id" {
@@ -552,6 +588,8 @@ impl Shell {
                 self.invalidate_chrome(cx);
             }
             "rename" => self.start_rename(RenameTarget::Session(id), window, cx),
+            action if action.starts_with("tweak:") => self.run_tweak_menu(id, action, window, cx),
+            "fork" => self.fork_chat(id, cx),
             "link-work-item" => self.open_link_dialog(id, window, cx),
             "reminder:cancel" => {
                 let occurrences: Vec<_> = self
@@ -821,6 +859,7 @@ impl Shell {
         if self.workspace.tab_of(id).is_some() {
             return;
         }
+        self.workspace.session_projects.remove(&id);
         if self
             .session_preview
             .as_ref()

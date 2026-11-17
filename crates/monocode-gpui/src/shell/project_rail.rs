@@ -1777,7 +1777,7 @@ impl Shell {
         .detach();
     }
     pub(super) fn sync_project_rail_git_stats(&mut self, cx: &mut Context<Self>) {
-        if let Some(stats) = self.git.read(cx).stats.clone() {
+        if let Some(stats) = self.shown_git_stats(cx) {
             self.project_rail_stats
                 .values
                 .insert(self.workspace.project.clone(), Some(stats));

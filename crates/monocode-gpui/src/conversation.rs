@@ -4,6 +4,7 @@ mod attachment_drop;
 mod background_tasks;
 mod btw;
 mod changes_shelf;
+mod chat_links;
 mod commands;
 pub(crate) mod composer_features;
 mod composer_shelf;
@@ -14,6 +15,8 @@ mod history;
 mod mobile;
 mod mono;
 mod notifications;
+#[cfg(test)]
+mod open_questions_tests;
 mod remote;
 pub(crate) mod remote_plans;
 mod response_menu;
@@ -48,7 +51,7 @@ pub(crate) use mobile::{
 pub(crate) use mono::QueueChanged as MonoQueueChanged;
 pub(crate) use mono::Submitted as MonoSubmitted;
 use monocode_core::{
-    agent::{AccessMode, Approval, Control, Decision, Settings},
+    agent::{AccessMode, Approval, Control, Decision, Question, Settings},
     catalog::{self, Model},
 };
 use monocode_core::{provider::Kind, store::Session};
@@ -125,6 +128,8 @@ struct OpenMenu {
 use response_menu::ResponseMenu;
 pub(crate) struct SessionChanged;
 pub(crate) struct ChooseFolder(pub(crate) AnchorSlot);
+/// The empty chat's project chip asked to move the chat to another project.
+pub(crate) struct ChooseProject(pub(crate) AnchorSlot);
 /// The review card asked to open the session's recorded changes.
 pub(crate) struct OpenSessionChanges(pub(crate) crate::review::ReviewTab);
 pub(crate) struct Conversation {
@@ -161,6 +166,8 @@ pub(crate) struct Conversation {
     >,
     attaching: bool,
     file_drag: bool,
+    /// A chat dragged from the sidebar is over the message box.
+    chat_drop: bool,
     attachment_error: Option<String>,
     app_environment: std::collections::HashMap<String, String>,
     /// The running turn's policy, independent of the next composer's mode.
@@ -200,6 +207,13 @@ pub(crate) struct Conversation {
     questions:
         std::collections::VecDeque<(Entity<crate::questions::QuestionCard>, Vec<Subscription>)>,
     question_overlay: crate::questions::Overlay,
+    /// Open questions whose agent is gone, answered with a new message.
+    restored_questions: std::collections::HashSet<String>,
+    composer_restored: bool,
+    composer_saved: String,
+    composer_save: Option<gpui::Task<()>>,
+    composer_revision: Arc<std::sync::atomic::AtomicU64>,
+    open_questions_revision: Arc<std::sync::atomic::AtomicU64>,
     controls: Option<std::sync::mpsc::Sender<Control>>,
     branch: Option<String>,
     git: Option<monocode_core::git::Snapshot>,
@@ -229,6 +243,7 @@ pub(crate) struct Conversation {
     branch_anchor: AnchorSlot,
     context_anchor: AnchorSlot,
     composer_anchor: AnchorSlot,
+    project_chip_anchor: AnchorSlot,
     composer_motion: ComposerMotion,
     narrow: bool,
     // A split or review pane sits beside this chat; only then does a narrow
@@ -246,6 +261,267 @@ pub(crate) struct Conversation {
     response_menu: Option<ResponseMenu>,
     response_request: Option<(usize, monocode_core::response::TransferKind, Instant)>,
 }
+impl Conversation {
+    fn add_question_card(&mut self, request: Question, cx: &mut Context<Self>) {
+        let card = cx.new(|cx| crate::questions::QuestionCard::new(request, cx));
+        let events = cx.subscribe(&card, |this, _, reply: &crate::questions::Answered, cx| {
+            if this
+                .questions
+                .front()
+                .is_none_or(|(card, _)| card.read(cx).id() != reply.id)
+            {
+                return;
+            }
+            if this.restored_questions.contains(&reply.id) {
+                this.answer_restored_question(reply, cx);
+                return;
+            }
+            let before = this.needs_approval();
+            let decision = reply
+                .answers
+                .clone()
+                .map_or(Decision::Deny, Decision::Answer);
+            if this.controls.as_ref().is_none_or(|controls| {
+                controls
+                    .send(Control {
+                        id: reply.id.clone(),
+                        decision,
+                    })
+                    .is_err()
+            }) {
+                this.status = "The provider is no longer waiting for this answer".into();
+                cx.notify();
+                return;
+            }
+            if let Some((card, _)) = this.questions.pop_front() {
+                this.question_overlay.release(card, cx);
+            }
+            this.save_open_questions(cx);
+            this.status = if !this.approvals.is_empty() {
+                "Waiting for approval"
+            } else if !this.questions.is_empty() {
+                "Waiting for your answer"
+            } else {
+                "Working…"
+            }
+            .into();
+            if before != this.needs_approval() {
+                cx.emit(SessionChanged);
+            }
+            cx.notify();
+        });
+        let keep_open = cx.subscribe(
+            &card,
+            |this, _, request: &crate::questions::KeptOpen, cx| {
+                if let Some(controls) = &this.controls {
+                    let _ = controls.send(Control {
+                        id: request.id.clone(),
+                        decision: Decision::KeepOpen,
+                    });
+                }
+                cx.emit(SessionChanged);
+                cx.notify();
+            },
+        );
+        self.questions.push_back((card, vec![events, keep_open]));
+    }
+
+    fn open_questions_key(&self) -> String {
+        format!("open-questions:{}", self.summary.id)
+    }
+
+    fn composer_text_key(&self) -> String {
+        format!("composer-text:{}", self.summary.id)
+    }
+
+    /// Questions stay saved until they are answered or skipped, so closing
+    /// the app never decides for the user.
+    fn save_open_questions(&mut self, cx: &mut Context<Self>) {
+        if self.is_remote() {
+            return;
+        }
+        let open: Vec<Question> = self
+            .questions
+            .iter()
+            .map(|(card, _)| card.read(cx).request().clone())
+            .collect();
+        let Ok(value) = serde_json::to_string(&open) else {
+            return;
+        };
+        let write = latest_write(
+            self.store.clone(),
+            self.open_questions_key(),
+            value,
+            &self.open_questions_revision,
+        );
+        cx.background_executor().spawn(write).detach();
+    }
+
+    fn sync_open_questions(&mut self, cx: &mut Context<Self>) {
+        let prompts = self
+            .questions
+            .iter()
+            .filter(|(card, _)| self.restored_questions.contains(card.read(cx).id()))
+            .flat_map(|(card, _)| card.read(cx).request().items.iter())
+            .map(|item| item.prompt.clone())
+            .collect();
+        self.transcript
+            .update(cx, |view, cx| view.set_open_questions(prompts, cx));
+    }
+
+    /// Drops the cards whose agent is gone for good, keeping the saved ones
+    /// that can still be answered with a new message.
+    fn clear_live_questions(&mut self, cx: &mut Context<Self>) {
+        let restored = std::mem::take(&mut self.restored_questions);
+        self.questions
+            .retain(|(card, _)| restored.contains(card.read(cx).id()));
+        self.restored_questions = restored;
+    }
+
+    /// The agent stopped with a question open, such as when the app closes.
+    /// The card stays, and its answer goes out as a new message.
+    fn keep_unanswered_questions(&mut self, cx: &mut Context<Self>) {
+        let ids: Vec<String> = self
+            .questions
+            .iter()
+            .map(|(card, _)| card.read(cx).id().to_owned())
+            .collect();
+        self.restored_questions.extend(ids);
+        self.sync_open_questions(cx);
+    }
+
+    fn restore_open_questions(&mut self, saved: Option<String>, cx: &mut Context<Self>) {
+        let Some(saved) = saved.filter(|_| !self.busy && self.questions.is_empty()) else {
+            return;
+        };
+        let Ok(questions) = serde_json::from_str::<Vec<Question>>(&saved) else {
+            return;
+        };
+        if questions.is_empty() {
+            return;
+        }
+        for mut question in questions {
+            question.auto_resolve_at = None;
+            self.restored_questions.insert(question.id.clone());
+            self.add_question_card(question, cx);
+        }
+        self.status = "Waiting for your answer".into();
+        self.sync_open_questions(cx);
+        cx.emit(SessionChanged);
+    }
+
+    /// The agent that asked is gone, so the answers go out as a new message.
+    fn answer_restored_question(
+        &mut self,
+        reply: &crate::questions::Answered,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((card, _)) = self.questions.pop_front() else {
+            return;
+        };
+        let request = card.read(cx).request().clone();
+        self.question_overlay.release(card, cx);
+        self.restored_questions.remove(&reply.id);
+        self.save_open_questions(cx);
+        if let Some(answers) = &reply.answers {
+            let pairs: Vec<(String, String)> = request
+                .items
+                .iter()
+                .enumerate()
+                .map(|(ix, item)| {
+                    let answer = answers
+                        .get(ix)
+                        .map(|answer| answer.join(", "))
+                        .filter(|answer| !answer.is_empty())
+                        .unwrap_or_else(|| "Skipped".to_owned());
+                    (item.prompt.clone(), answer)
+                })
+                .collect();
+            let text = crate::transcript::question_box::restored_message(&pairs);
+            let message = self.message(text, Vec::new(), None, cx);
+            if !self.busy {
+                self.follow_ups.requested = Some(message.id.clone());
+            }
+            self.follow_ups.motion.insert(
+                &message.id,
+                self.follow_ups.state.messages.is_empty(),
+                !cx.reduce_motion(),
+            );
+            self.follow_ups.state.messages.push(message);
+            self.save_follow_ups(cx);
+        }
+        self.status = if !self.questions.is_empty() {
+            "Waiting for your answer"
+        } else if self.busy {
+            "Working…"
+        } else {
+            "Ready"
+        }
+        .into();
+        self.sync_open_questions(cx);
+        cx.emit(SessionChanged);
+        cx.notify();
+    }
+
+    /// Text typed but not sent is kept per chat, a moment after typing stops.
+    /// An emptied box saves at once, so a sent message cannot come back.
+    fn schedule_composer_save(&mut self, cx: &mut Context<Self>) {
+        if self.is_remote() || !self.composer_restored {
+            return;
+        }
+        let text = self.input.read(cx).content.to_string();
+        if text == self.composer_saved {
+            return;
+        }
+        self.composer_saved = text.clone();
+        let wait = !text.trim().is_empty();
+        let write = latest_write(
+            self.store.clone(),
+            self.composer_text_key(),
+            text,
+            &self.composer_revision,
+        );
+        self.composer_save = Some(cx.spawn(async move |_, cx| {
+            if wait {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(250))
+                    .await;
+            }
+            cx.background_executor().spawn(write).await;
+        }));
+    }
+
+    fn restore_composer_text(&mut self, saved: Option<String>, cx: &mut Context<Self>) {
+        if let Some(saved) = saved.filter(|text| !text.is_empty())
+            && self.input.read(cx).content.is_empty()
+        {
+            self.composer_saved = saved.clone();
+            self.input.update(cx, |input, cx| input.set_text(saved, cx));
+        }
+        self.composer_restored = true;
+        self.schedule_composer_save(cx);
+    }
+}
+
+/// A save that yields to any newer save of the same value. Background writes
+/// can run out of order, and the oldest must never be the one that lands.
+fn latest_write(
+    store: Arc<std::sync::Mutex<monocode_core::store::Store>>,
+    key: String,
+    value: String,
+    revision: &Arc<std::sync::atomic::AtomicU64>,
+) -> impl std::future::Future<Output = ()> + Send + 'static {
+    let mine = revision.fetch_add(1, Ordering::SeqCst) + 1;
+    let revision = revision.clone();
+    async move {
+        if let Ok(store) = locked(&store)
+            && revision.load(Ordering::SeqCst) == mine
+        {
+            let _ = store.save_setting(&key, &value);
+        }
+    }
+}
+
 impl Drop for Conversation {
     fn drop(&mut self) {
         if let Some(cancel) = self.worktree_name_cancel.take() {
@@ -484,6 +760,7 @@ impl Conversation {
         let completion = cx.new(|cx| {
             crate::composer_completion::Completion::new(input.clone(), summary.cwd.clone(), cx)
                 .with_store(store.clone())
+                .for_session(summary.id)
         });
         completion.update(cx, |completion, cx| {
             completion.set_provider(&summary.provider, cx)
@@ -523,6 +800,7 @@ impl Conversation {
                 cx.notify();
             }
             this.open_typed_btw(cx);
+            this.schedule_composer_save(cx);
         });
         input.update(cx, |input, _| input.set_alternate_submit(true));
         let submission = cx.subscribe(&input, |this, _, _: &input::Submitted, cx| this.send(cx));
@@ -619,6 +897,7 @@ impl Conversation {
             attachment_photos: Default::default(),
             attaching: false,
             file_drag: false,
+            chat_drop: false,
             attachment_error: None,
             app_environment: Default::default(),
             app_read_only: false,
@@ -659,6 +938,12 @@ impl Conversation {
             approval_ui: Default::default(),
             questions: Default::default(),
             question_overlay: Default::default(),
+            restored_questions: Default::default(),
+            composer_restored: false,
+            composer_saved: String::new(),
+            composer_save: None,
+            composer_revision: Default::default(),
+            open_questions_revision: Default::default(),
             controls: None,
             branch: git.as_ref().and_then(|s| s.current.clone()),
             git,
@@ -683,6 +968,7 @@ impl Conversation {
             branch_anchor: AnchorSlot::default(),
             context_anchor: AnchorSlot::default(),
             composer_anchor: AnchorSlot::default(),
+            project_chip_anchor: AnchorSlot::default(),
             composer_motion: ComposerMotion::default(),
             narrow: false,
             beside_pane: false,
@@ -734,6 +1020,8 @@ impl Conversation {
         let store = self.store.clone();
         let id = self.summary.id;
         let mono = self.settings.mono.is_some();
+        let open_questions_key = self.open_questions_key();
+        let composer_text_key = self.composer_text_key();
         let work = cx.background_executor().spawn(async move {
             let settings = locked(&store).and_then(|s| s.agent_settings(id));
             (
@@ -757,10 +1045,19 @@ impl Conversation {
                 locked(&store).and_then(|s| s.context_usage(id)),
                 locked(&store).and_then(|s| s.follow_ups(id)),
                 locked(&store).and_then(|s| s.history_before(id)),
+                locked(&store)
+                    .and_then(|s| s.setting(&open_questions_key))
+                    .ok()
+                    .flatten(),
+                locked(&store)
+                    .and_then(|s| s.setting(&composer_text_key))
+                    .ok()
+                    .flatten(),
             )
         });
         cx.spawn(async move |this, cx| {
-            let (result, settings, context, follow_ups, before) = work.await;
+            let (result, settings, context, follow_ups, before, open_questions, composer_text) =
+                work.await;
             let _ = this.update(cx, |this, cx| {
                 this.loading = false;
                 this.context = context.ok().flatten();
@@ -822,6 +1119,8 @@ impl Conversation {
                         });
                         this.status = "Ready".into();
                         this.loaded = true;
+                        this.restore_composer_text(composer_text, cx);
+                        this.restore_open_questions(open_questions, cx);
                         if let Some((row, query)) = this.pending_search.take() {
                             this.reveal_search(row, query, cx);
                         }
@@ -1141,10 +1440,12 @@ impl Conversation {
         });
         if !self.is_remote() && settings.prepared_prompt.is_none() {
             let prepared = self.completion.read(cx).prepare_prompt(&prompt);
+            let prepared = self.with_linked_chats(&prompt, prepared);
             if prepared != prompt {
                 settings.prepared_prompt = Some(prepared);
             }
         }
+        settings.chat_links = self.has_chat_links();
         settings.disable_claude_hooks = cx
             .try_global::<crate::settings::Preferences>()
             .is_some_and(|p| !p.claude_hooks);
@@ -1192,7 +1493,7 @@ impl Conversation {
         let (controls, control_rx) = std::sync::mpsc::channel();
         self.controls = Some(controls);
         self.approvals.clear();
-        self.questions.clear();
+        self.clear_live_questions(cx);
         let (tx, rx) = async_channel::bounded(8);
         let mut turn_model_id = settings
             .turn_model
@@ -1385,68 +1686,8 @@ impl Conversation {
                             this.questions.retain(|(card, _)| card.read(cx).id() != id);
                         }
                         for request in update.questions.into_iter().filter(|_| !stopping) {
-                            let card =
-                                cx.new(|cx| crate::questions::QuestionCard::new(request, cx));
-                            let events = cx.subscribe(
-                                &card,
-                                |this, _, reply: &crate::questions::Answered, cx| {
-                                    if this
-                                        .questions
-                                        .front()
-                                        .is_none_or(|(card, _)| card.read(cx).id() != reply.id)
-                                    {
-                                        return;
-                                    }
-                                    let before = this.needs_approval();
-                                    let decision = reply
-                                        .answers
-                                        .clone()
-                                        .map_or(Decision::Deny, Decision::Answer);
-                                    if this.controls.as_ref().is_none_or(|controls| {
-                                        controls
-                                            .send(Control {
-                                                id: reply.id.clone(),
-                                                decision,
-                                            })
-                                            .is_err()
-                                    }) {
-                                        this.status =
-                                            "The provider is no longer waiting for this answer"
-                                                .into();
-                                        cx.notify();
-                                        return;
-                                    }
-                                    if let Some((card, _)) = this.questions.pop_front() {
-                                        this.question_overlay.release(card, cx);
-                                    }
-                                    this.status = if !this.approvals.is_empty() {
-                                        "Waiting for approval"
-                                    } else if !this.questions.is_empty() {
-                                        "Waiting for your answer"
-                                    } else {
-                                        "Working…"
-                                    }
-                                    .into();
-                                    if before != this.needs_approval() {
-                                        cx.emit(SessionChanged);
-                                    }
-                                    cx.notify();
-                                },
-                            );
-                            let keep_open = cx.subscribe(
-                                &card,
-                                |this, _, request: &crate::questions::KeptOpen, cx| {
-                                    if let Some(controls) = &this.controls {
-                                        let _ = controls.send(Control {
-                                            id: request.id.clone(),
-                                            decision: Decision::KeepOpen,
-                                        });
-                                    }
-                                    cx.emit(SessionChanged);
-                                    cx.notify();
-                                },
-                            );
-                            this.questions.push_back((card, vec![events, keep_open]));
+                            this.add_question_card(request, cx);
+                            this.save_open_questions(cx);
                             this.status = "Waiting for your answer".into();
                         }
                         if !finished && !this.approvals.is_empty() {
@@ -1499,7 +1740,7 @@ impl Conversation {
                                 this.save_follow_ups(cx);
                             }
                             this.approvals.clear();
-                            this.questions.clear();
+                            this.keep_unanswered_questions(cx);
                             this.controls = None;
                             this.transcript.update(cx, |v, cx| v.streaming(false, cx));
                             let model_id = turn_model_id.clone();
@@ -1564,6 +1805,7 @@ impl Conversation {
 
 impl EventEmitter<SessionChanged> for Conversation {}
 impl EventEmitter<ChooseFolder> for Conversation {}
+impl EventEmitter<ChooseProject> for Conversation {}
 impl EventEmitter<OpenSessionChanges> for Conversation {}
 impl EventEmitter<Transfer> for Conversation {}
 impl EventEmitter<composer_features::StartOrchestration> for Conversation {}
@@ -2746,7 +2988,9 @@ impl Conversation {
         self.follow_ups.ready = false;
         self.clear_background();
         self.approvals.clear();
-        self.questions.clear();
+        self.clear_live_questions(cx);
+        // Stop is the user's own choice, so those questions are done with.
+        self.save_open_questions(cx);
         self.controls = None;
         self.status = "Ready".into();
         self.transcript
@@ -2914,7 +3158,9 @@ impl Conversation {
                     .border_1()
                     .border_color(composer_border(self.input.focus_handle(cx).is_focused(window)))
                     .shadow(composer_shadow())
-                    .when(self.file_drag, |d| d.border_color(accent_color().opacity(0.6)))
+                    .when(self.file_drag || self.chat_drop, |d| {
+                        d.border_color(accent_color().opacity(0.6))
+                    })
                     .flex()
                     .flex_col()
                     .on_mouse_down(
@@ -3054,7 +3300,8 @@ impl Conversation {
                             )
                             .child(self.action(has_value, window, cx)),
                     )
-                    .children(self.attachment_drop_overlay(12.)),
+                    .children(self.attachment_drop_overlay(12.))
+                    .children(self.chat_drop_overlay(12.)),
             )
             .children(runner.map(|runner| {
                 runner.cached(crate::composer_runner::Runner::placement())
@@ -3418,11 +3665,12 @@ impl Conversation {
                                 .text_size(px(18.))
                                 .line_height(px(28.))
                                 .text_color(content(1.))
-                                .truncate()
-                                .child(format!(
-                                    "What should we work on in {}?",
-                                    self.project_appearance.label(&self.summary.cwd)
-                                )),
+                                .flex()
+                                .items_center()
+                                .gap(px(8.))
+                                .child(div().flex_shrink_0().child("What should we work on in"))
+                                .child(self.empty_session_project_chip(cx))
+                                .child(div().flex_shrink_0().child("?")),
                         )
                     })
                     .child(self.composer(window, cx))
@@ -3431,6 +3679,41 @@ impl Conversation {
                     }),
             )
             .into_any()
+    }
+}
+
+impl Conversation {
+    /// Names the new chat's project with its icon, so a project named like an
+    /// agent (for example "Claude") still reads as a project. A click lets the
+    /// chat start in another project instead.
+    fn empty_session_project_chip(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let label = self.project_appearance.label(&self.summary.cwd);
+        div()
+            .id("empty-session-project")
+            .debug_selector(|| "empty-session-project".into())
+            .role(Role::Button)
+            .aria_label(format!("Project {label}, choose another project"))
+            .cursor_pointer()
+            .relative()
+            .min_w_0()
+            .h(px(32.))
+            .px(px(8.))
+            .rounded_md()
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .bg(content(0.08))
+            .hover(|s| s.bg(content(0.12)))
+            .child(crate::project_settings::header_project_icon(
+                &self.project_appearance,
+                &self.summary.cwd,
+            ))
+            .child(div().min_w_0().truncate().child(label))
+            .child(icon("chevron-down", 14.).flex_shrink_0().opacity(0.6))
+            .child(self.project_chip_anchor.probe())
+            .on_click(cx.listener(|this, _, _, cx| {
+                cx.emit(ChooseProject(this.project_chip_anchor.clone()));
+            }))
     }
 }
 

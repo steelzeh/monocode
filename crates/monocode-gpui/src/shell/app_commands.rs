@@ -49,7 +49,8 @@ impl Shell {
         result: Result<Value, String>,
         cx: &mut Context<Self>,
     ) {
-        if !mutating(&call.action) {
+        // Only an external caller can repeat a request and need its receipt.
+        if !mutating(&call.action) || tweak_owner(&call.request_id).is_some() {
             self.app_pending
                 .remove(&(call.session, call.request_id.clone()));
             let _ = call.reply.send(result);
@@ -144,6 +145,52 @@ impl Shell {
         {
             return Err("request ID must use letters, digits, underscores or hyphens".into());
         }
+        // Every chat may read and name itself. Naming others needs Operator.
+        let operator = self
+            .sessions
+            .get(&call.session)
+            .is_some_and(|v| v.read(cx).settings.operator_enabled);
+        if app::is_title_action(&call.action) && !operator {
+            if !self.sessions.contains_key(&call.session) {
+                return Err("Session was not found".into());
+            }
+            if call.input.get("sessionId").is_some()
+                && session_id(&call.input, "sessionId", &self.store)? != call.session
+            {
+                return Err(
+                    "This chat can only read or change its own title. Use /operator to name other sessions."
+                        .into(),
+                );
+            }
+            return Ok(());
+        }
+        // The user linked these two chats, so each agent may read the other
+        // chat and send it messages, in any project and without Operator.
+        let chat_action = matches!(call.action.as_str(), "sessions.read" | "sessions.send");
+        if chat_action && self.linked_chat(call.session, &call.input).is_some() {
+            let caller = self
+                .sessions
+                .get(&call.session)
+                .map(|v| v.read(cx))
+                .ok_or("Session was not found")?;
+            if call.action == "sessions.send"
+                && (caller.app_read_only
+                    || caller.settings.plan
+                    || caller.settings.access == monocode_core::agent::AccessMode::ReadOnly)
+            {
+                return Err(
+                    "This chat is read-only now. It can read the linked chat, but it cannot send it a message."
+                        .into(),
+                );
+            }
+            return Ok(());
+        }
+        if chat_action && !operator {
+            return Err(
+                "This chat is not linked with that chat. The user links two chats with @ in the message box. Other chats need /operator."
+                    .into(),
+            );
+        }
         let caller = self
             .sessions
             .get(&call.session)
@@ -172,6 +219,7 @@ impl Shell {
                 "models.list"
                     | "sessions.list"
                     | "sessions.read"
+                    | "sessions.title"
                     | "folders.list"
                     | "notes.list"
                     | "notes.read"
@@ -236,6 +284,62 @@ impl Shell {
         })
         .detach();
         let _ = window;
+    }
+    /// The chat an action names, when the user linked it with the caller.
+    fn linked_chat(&self, caller: i64, input: &Value) -> Option<i64> {
+        let id = session_id(input, "sessionId", &self.store).ok()?;
+        (self.session_summaries.contains_key(&id)
+            && locked(&self.store).ok()?.chats_linked(caller, id).ok()?)
+        .then_some(id)
+    }
+    /// Delivers a message from the agent of one linked chat to the other
+    /// chat. A busy chat gets it when its turn ends.
+    fn send_chat_message(
+        &mut self,
+        from: i64,
+        to: i64,
+        input: &Value,
+        cx: &mut Context<Self>,
+    ) -> Result<Value, String> {
+        use monocode_core::session_title::display_title;
+        let prompt = app::prompt(input)?;
+        let target = self.session_metadata(to, cx);
+        if target.summary.archived {
+            return Err("That chat is archived. The user must restore it first.".into());
+        }
+        if target.summary.cwd.starts_with("remote://")
+            || self.orchestration_worker(to)
+            || self
+                .monos
+                .as_ref()
+                .is_some_and(|m| m.read(cx).is_mono_session(to))
+        {
+            return Err("Only a regular chat on this machine can get a message.".into());
+        }
+        let queued = target.busy;
+        let title = display_title(&target.summary.title, &target.summary.provider).to_owned();
+        let sender = self.session_metadata(from, cx).summary;
+        let sender = monocode_core::chat_links::Chat {
+            id: from,
+            title: display_title(&sender.title, &sender.provider).to_owned(),
+            cwd: sender.cwd.clone(),
+        };
+        let view = self.ensure_session(to, cx).ok_or("Session not found")?;
+        view.update(cx, |chat, cx| chat.receive_chat_message(sender, prompt, cx));
+        Ok(json!({"sessionId": to, "title": title, "submitted": true, "queued": queued}))
+    }
+    /// A title action's session: the caller unless it names another one.
+    fn title_target(
+        &self,
+        input: &Value,
+        caller: i64,
+        project: &str,
+        cx: &App,
+    ) -> Result<i64, String> {
+        if input.get("sessionId").is_none() {
+            return Ok(caller);
+        }
+        self.app_target(input, caller, project, false, cx)
     }
     fn app_target(
         &self,
@@ -317,12 +421,78 @@ impl Shell {
             self.finish_app_call(call, Err(error), cx);
             return;
         }
+        self.run_app_call(call, window, cx);
+    }
+    /// Runs an action for a tweak. The tweak system has already checked its
+    /// permission, so the Operator's checks do not apply.
+    pub(super) fn run_tweak_app_call(
+        &mut self,
+        call: Call,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let checked = app::validate_tweak_call(&call.action, &call.input).and_then(|()| {
+            self.ensure_session(call.session, cx)
+                .map(|_| ())
+                .ok_or_else(|| "That chat no longer exists".to_owned())
+        });
+        match checked {
+            Ok(()) => self.run_app_call(call, window, cx),
+            Err(error) => {
+                let _ = call.reply.send(Err(error));
+            }
+        }
+    }
+    /// The background model chosen in Settings, else the chat's own provider.
+    /// As for automatic titles, the chat's provider uses the chat's account.
+    pub(super) fn text_model_for_session(
+        &self,
+        id: i64,
+        cx: &App,
+    ) -> monocode_core::session_title::TextModel {
+        use monocode_core::session_title::TextModel;
+        let summary = self.session_metadata(id, cx).summary;
+        let provider = Kind::from_id(&summary.provider);
+        let account = |kind| {
+            let own = (kind == provider)
+                .then(|| match self.sessions.get(&id) {
+                    Some(view) => Some(view.read(cx).settings.account.clone()),
+                    None => locked(&self.store)
+                        .ok()?
+                        .agent_settings(id)
+                        .ok()
+                        .flatten()
+                        .map(|settings| settings.account),
+                })
+                .flatten();
+            own.unwrap_or_else(|| {
+                crate::accounts::get(cx)
+                    .map(|center| center.read(cx).selected(kind, &summary.cwd))
+                    .unwrap_or_default()
+            })
+        };
+        let chosen = cx
+            .try_global::<crate::settings::Preferences>()
+            .and_then(|p| p.background_text_model());
+        match chosen {
+            Some((kind, model)) => TextModel {
+                account: account(kind),
+                kind,
+                model,
+            },
+            None => TextModel::automatic(provider, account(provider)),
+        }
+    }
+    fn run_app_call(&mut self, call: Call, window: &mut Window, cx: &mut Context<Self>) {
         let caller = self.sessions[&call.session].read(cx);
         let project = caller.summary.cwd.clone();
         let provider = caller.summary.provider.clone();
         let inherited = caller.settings.clone();
         let input = call.input.clone();
         let action = call.action.clone();
+        let linked = matches!(action.as_str(), "sessions.read" | "sessions.send")
+            .then(|| self.linked_chat(call.session, &input))
+            .flatten();
         let result: Result<Value, String> = match action.as_str() {
             "sessions.list" => Ok(
                 json!({"cwd":project,"sessions":self.order.iter().filter_map(|id|{
@@ -400,7 +570,24 @@ impl Shell {
                 },cx);
                 return;
             }
-            "sessions.read" => match self.app_target(&input, call.session, &project, false, cx) {
+            "sessions.title" => self.title_target(&input, call.session, &project, cx).map(|id| {
+                let summary = self.session_metadata(id, cx).summary;
+                json!({"sessionId": id, "title": monocode_core::session_title::display_title(&summary.title, &summary.provider)})
+            }),
+            "sessions.rename" => match (
+                self.title_target(&input, call.session, &project, cx),
+                app::text(&input, "title", 120),
+            ) {
+                (Ok(id), Ok(title)) => {
+                    self.set_session_title(id, title.clone(), cx);
+                    Ok(json!({"sessionId": id, "title": title}))
+                }
+                (Err(e), _) | (_, Err(e)) => Err(e),
+            },
+            "sessions.read" => match linked.map_or_else(
+                || self.app_target(&input, call.session, &project, false, cx),
+                Ok,
+            ) {
                 Ok(id) => {
                     let busy = self.session_metadata(id, cx).busy;
                     let draft = self
@@ -422,6 +609,9 @@ impl Shell {
                 }
                 Err(e) => Err(e),
             },
+            "sessions.send" if linked.is_some() => {
+                self.send_chat_message(call.session, linked.unwrap_or_default(), &input, cx)
+            }
             "sessions.send" | "sessions.draft" | "sessions.stop" | "sessions.archive"
             | "sessions.delete" => {
                 match self
@@ -575,13 +765,14 @@ impl Shell {
                 }
             },
             "worktrees.list" | "worktrees.create" => {
+                let focused = self.worktree_focus.get(&project).map(|f| f.path.clone());
                 self.app_background(
                     call,
                     move |_| {
                         let root = std::path::Path::new(&project);
                         let value = if action == "worktrees.list" {
                             let snapshot = monocode_core::git::snapshot(root)?;
-                            json!({"worktrees":snapshot.worktrees.iter().map(worktree_json).collect::<Vec<_>>(),"branches":snapshot.branches.iter().map(|b|json!({"name":b.name,"remote":b.remote})).collect::<Vec<_>>()})
+                            json!({"worktrees":snapshot.worktrees.iter().map(worktree_json).collect::<Vec<_>>(),"focused":focused,"branches":snapshot.branches.iter().map(|b|json!({"name":b.name,"remote":b.remote})).collect::<Vec<_>>()})
                         } else {
                             let branch = app::text(&input, "branch", 400)?;
                             let base = app::optional_text(&input, "base", 400)?;
@@ -602,10 +793,100 @@ impl Shell {
                 );
                 return;
             }
+            "sessions.setWorking" => {
+                match self.app_target(&input, call.session, &project, false, cx) {
+                    Ok(id) => {
+                        let owner = tweak_owner(&call.request_id).unwrap_or_default();
+                        self.set_title_working(id, owner, input["working"] == true);
+                        self.invalidate_chrome(cx);
+                        Ok(json!({"sessionId": id}))
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+            "worktrees.select" => {
+                if project != self.workspace.project {
+                    Err("That project is not the one on screen".to_owned())
+                } else {
+                    match input.get("path").and_then(Value::as_str) {
+                        None => {
+                            self.select_worktree(None, window, cx);
+                            Ok(json!({"path": null}))
+                        }
+                        Some(path) => {
+                            let tree = crate::git_cache::get(&project).and_then(|git| {
+                                git.worktrees.into_iter().find(|tree| {
+                                    !tree.missing
+                                        && monocode_core::files::path_key(&tree.path)
+                                            == monocode_core::files::path_key(path)
+                                })
+                            });
+                            match tree {
+                                Some(tree) => {
+                                    let path = tree.path.clone();
+                                    self.select_worktree(
+                                        Some(crate::worktree_switcher::WorktreeFocus {
+                                            path: tree.path,
+                                            branch: tree.branch,
+                                        }),
+                                        window,
+                                        cx,
+                                    );
+                                    Ok(json!({"path": path}))
+                                }
+                                None => Err("That worktree does not exist".to_owned()),
+                            }
+                        }
+                    }
+                }
+            }
+            "composer.insert" => match app::text(&input, "text", 64 * 1024) {
+                Ok(text) => {
+                    self.sessions[&call.session]
+                        .update(cx, |session, cx| session.insert_composer_text(&text, cx));
+                    Ok(json!({}))
+                }
+                Err(e) => Err(e),
+            },
+            "models.ask" => match app::text(&input, "prompt", 128 * 1024) {
+                Ok(prompt) => {
+                    let text = self.text_model_for_session(call.session, cx);
+                    let cwd = self.session_working_copy(call.session, cx).to_owned();
+                    let cancel = self
+                        .tweak_cancels
+                        .get(&call.request_id)
+                        .cloned()
+                        .unwrap_or_default();
+                    self.app_background(
+                        call,
+                        move |_| {
+                            // GPUI unit tests never start a provider.
+                            let answer = if cfg!(test) {
+                                format!("Answer from {} characters", prompt.chars().count())
+                            } else {
+                                app::ask_text_model(
+                                    text,
+                                    std::path::Path::new(&cwd),
+                                    &prompt,
+                                    cancel,
+                                )?
+                            };
+                            Ok((json!({"text": answer}), Effect::None))
+                        },
+                        cx,
+                    );
+                    return;
+                }
+                Err(e) => Err(e),
+            },
             _ => Err("Unknown Operator action".into()),
         };
         self.finish_app_call(call, result, cx);
     }
+}
+/// The tweak an in-app call belongs to.
+fn tweak_owner(request_id: &str) -> Option<&str> {
+    request_id.strip_prefix("tweak:")?.split(':').next()
 }
 fn mutating(action: &str) -> bool {
     !matches!(
@@ -613,6 +894,7 @@ fn mutating(action: &str) -> bool {
         "models.list"
             | "sessions.list"
             | "sessions.read"
+            | "sessions.title"
             | "folders.list"
             | "notes.list"
             | "notes.read"
@@ -620,7 +902,7 @@ fn mutating(action: &str) -> bool {
     )
 }
 fn worktree_json(tree: &monocode_core::git::Worktree) -> Value {
-    json!({"path":tree.path,"branch":tree.branch,"head":tree.head,"main":tree.main,"missing":tree.missing})
+    json!({"path":tree.path,"branch":tree.branch,"head":tree.head,"main":tree.main,"missing":tree.missing,"submodule":tree.submodule})
 }
 fn session_id(input: &Value, key: &str, store: &Database) -> Result<i64, String> {
     match input.get(key) {

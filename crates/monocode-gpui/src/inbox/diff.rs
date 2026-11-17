@@ -110,6 +110,7 @@ pub(super) fn models(diff: &Diff) -> Vec<DiffFile> {
                 can_stage: false,
                 can_discard: false,
                 can_stage_hunk: false,
+                review: false,
             }
         })
         .collect()

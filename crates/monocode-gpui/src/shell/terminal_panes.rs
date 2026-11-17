@@ -271,8 +271,8 @@ impl Shell {
         let Some(tab) = self.workspace.tab_of(pane) else {
             return;
         };
-        if let Some(session) = self.ensure_session(owner, cx) {
-            self.workspace.project = session.read(cx).summary.cwd.clone();
+        if self.ensure_session(owner, cx).is_some() {
+            self.workspace.project = self.session_project(owner, cx).to_owned();
         }
         if let Some(monos) = &self.monos {
             monos.update(cx, |m, cx| m.close(cx));

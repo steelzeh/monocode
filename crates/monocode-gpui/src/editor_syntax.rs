@@ -583,6 +583,7 @@ fn diagnostics(tree: &Tree, text: &str) -> Vec<Diagnostic> {
             }
         }
         found.push(Diagnostic {
+            server: false,
             from,
             to,
             severity: "error".into(),

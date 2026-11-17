@@ -172,6 +172,10 @@ impl QuestionCard {
             })
             .collect()
     }
+    /// The way forward from a page: one already visited, or an answered one.
+    fn can_forward(&self, ix: usize, cx: &App) -> bool {
+        ix + 1 < self.request.items.len() && (ix < self.reached || self.answered(ix, cx))
+    }
     fn answered(&self, ix: usize, cx: &App) -> bool {
         !self.selected[ix].is_empty()
             || (self.request.items[ix].allow_custom
@@ -266,7 +270,7 @@ impl QuestionCard {
                 _ => return,
             },
             "left" if ix > 0 => self.go(ix - 1, cx),
-            "right" if ix < self.reached => self.go(ix + 1, cx),
+            "right" if self.can_forward(ix, cx) => self.go(ix + 1, cx),
             "tab" if self.request.items[ix].allow_custom => {
                 window.focus(&self.fields[ix].focus_handle(cx), cx)
             }
@@ -407,6 +411,7 @@ impl QuestionCard {
     fn header_controls(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let total = self.request.items.len();
         let step = self.step;
+        let forward = self.can_forward(step, cx);
         let countdown = self.request.auto_resolve_at.map(|deadline| {
             let remaining = deadline.saturating_sub(monocode_core::time::now_ms());
             if remaining > 60_000 {
@@ -446,16 +451,11 @@ impl QuestionCard {
                     total
                 )))
                 .child(
-                    icon_button_enabled(
-                        "question-next",
-                        "Next question",
-                        "chevron-right",
-                        step < self.reached,
-                    )
-                    .debug_selector(|| "question-next".into())
-                    .when(step < self.reached, |b| {
-                        b.on_click(cx.listener(|this, _, _, cx| this.go(this.step + 1, cx)))
-                    }),
+                    icon_button_enabled("question-next", "Next question", "chevron-right", forward)
+                        .debug_selector(|| "question-next".into())
+                        .when(forward, |b| {
+                            b.on_click(cx.listener(|this, _, _, cx| this.go(this.step + 1, cx)))
+                        }),
                 )
             })
             .child(
@@ -472,8 +472,12 @@ impl QuestionCard {
         let ready = self.answered(ix, cx);
         let last = ix + 1 == self.request.items.len();
         // Single choices advance on click; a typed or multiple answer needs a
-        // button. A revisited page offers the way forward too.
-        let proceed = ready && (item.multiple || typing || ix < self.reached || !item.allow_custom);
+        // button. A revisited page offers the way forward too. A typed answer
+        // keeps its button without focus: the press on the button takes focus
+        // from the field before the click lands.
+        let typed = item.allow_custom && !field.read(cx).content.trim().is_empty();
+        let proceed =
+            ready && (item.multiple || typing || typed || ix < self.reached || !item.allow_custom);
         div()
             .m(px(6.))
             .mt(px(4.))
@@ -912,5 +916,39 @@ mod tests {
         click(visual, "question-skip");
         click(visual, "question-skip");
         assert_eq!(*replies.borrow(), vec![None]);
+    }
+    #[gpui::test]
+    fn a_typed_answer_moves_on_after_the_field_loses_focus(cx: &mut TestAppContext) {
+        // Nothing has focus here, as after the mouse went down on a button.
+        let (window, _replies, _events) = card(cx);
+        let visual = &mut VisualTestContext::from_window(window.into(), cx);
+        assert!(visual.debug_bounds("question-continue").is_none());
+        window
+            .update(visual, |card, _, cx| {
+                card.fields[0].update(cx, |field, cx| field.set_text("Typed".into(), cx))
+            })
+            .unwrap();
+        click(visual, "question-continue");
+        window
+            .update(visual, |card, _, _| assert_eq!(card.step, 1))
+            .unwrap();
+
+        // The arrow moves on from a typed answer too, not only from visited pages.
+        let (window, _replies, _events) = card(cx);
+        let visual = &mut VisualTestContext::from_window(window.into(), cx);
+        window
+            .update(visual, |card, _, cx| {
+                assert!(!card.can_forward(0, cx));
+                card.fields[0].update(cx, |field, cx| field.set_text("Typed".into(), cx))
+            })
+            .unwrap();
+        click(visual, "question-next");
+        window
+            .update(visual, |card, _, cx| {
+                assert_eq!(card.step, 1);
+                // The last page has nowhere to go.
+                assert!(!card.can_forward(1, cx));
+            })
+            .unwrap();
     }
 }

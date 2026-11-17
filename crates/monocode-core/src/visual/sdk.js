@@ -169,6 +169,50 @@
   };
   Object.freeze(api);
   Object.defineProperty(globalThis, "visual", {value: api, writable: false, configurable: false});
+  // A tweak's one way to reach the app. The app decides whether each call is
+  // allowed; a script can only call from inside one of its handlers.
+  let context;
+  const queued = [];
+  let running = false;
+  let nextRequest = 1;
+  const menuHandlers = new Map();
+  const refreshHandlers = [];
+  const answers = new Map();
+  const app = (action, input, fn) => {
+    assert(running, "A tweak can only call the app from one of its handlers");
+    assert(typeof action === "string" && action.length > 0, "tweak.app takes an action name");
+    assert(input === undefined || (input && typeof input === "object" && !Array.isArray(input)),
+      "tweak.app takes its input as an object");
+    assert(fn === undefined || typeof fn === "function", "tweak.app takes a function for the answer");
+    assert(queued.length < 16, "Too many app calls at once");
+    const request = nextRequest++;
+    queued.push({request, action, input: input ?? {}});
+    if (fn) answers.set(String(request), fn);
+  };
+  const tweak = Object.freeze({
+    get context() { return context; },
+    app,
+    onRefresh(fn) {
+      assert(typeof fn === "function", "onRefresh takes a function");
+      refreshHandlers.push(fn);
+    },
+  });
+  const scriptTweak = Object.freeze({
+    app,
+    onMenu(id, fn) {
+      assert(typeof id === "string" && typeof fn === "function", "onMenu takes a menu id and a function");
+      menuHandlers.set(id, fn);
+    },
+  });
+  const run = (fn, ...values) => {
+    running = true;
+    try {
+      const result = fn(...values);
+      assert(!result || typeof result.then !== "function", "Tweak handlers must be synchronous");
+    } finally {
+      running = false;
+    }
+  };
   const render = () => {
     handlers.clear();
     generation++;
@@ -183,7 +227,7 @@
     return result;
   };
   return Object.freeze({
-    init(source) {
+    init(source, host, script) {
       // Source-seeded randomness makes setup data reproducible across checking,
       // publication and reload. The stream advances normally within this VM.
       const multiply = Math.imul;
@@ -193,8 +237,15 @@
         seed = (multiply(seed, 1103515245) + 12345) >>> 0;
         return (seed >>> 1) / 2147483648;
       }});
-      renderView = FunctionBody("visual", `"use strict";\n${source}`)(api);
-      assert(typeof renderView === "function", "Visual program must return a render function: return () => visual.text('Hello')");
+      if (script) {
+        FunctionBody("tweak", `"use strict";\n${source}`)(scriptTweak);
+      } else if (host === undefined) {
+        renderView = FunctionBody("visual", `"use strict";\n${source}`)(api);
+      } else {
+        context = parse(host);
+        renderView = FunctionBody("visual", "tweak", `"use strict";\n${source}`)(api, tweak);
+      }
+      assert(script || typeof renderView === "function", "Visual program must return a render function: return () => visual.text('Hello')");
     },
     render,
     dispatch(id, payload) {
@@ -203,9 +254,33 @@
       assert(!entry.disabled, "This visual control is disabled");
       const value = parse(payload);
       assert(entry.accepts(value), "Invalid value for this visual control");
-      const result = entry.fn(value);
-      assert(!result || typeof result.then !== "function", "Visual handlers must be synchronous");
+      run(entry.fn, value);
       return render();
+    },
+    runMenu(id, chat) {
+      const fn = menuHandlers.get(id);
+      assert(fn, `This tweak has no handler for the menu item ${id}`);
+      run(fn, parse(chat));
+    },
+    deliver(request, payload) {
+      const fn = answers.get(request);
+      if (fn) {
+        answers.delete(request);
+        const answer = parse(payload);
+        run(fn, answer.result, answer.error);
+      }
+      if (renderView) return render();
+    },
+    refresh() {
+      for (const fn of refreshHandlers) run(fn);
+      return render();
+    },
+    setContext(next) {
+      context = parse(next);
+      return render();
+    },
+    takeCalls() {
+      return stringify(queued.splice(0));
     },
   });
 })()

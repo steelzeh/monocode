@@ -302,6 +302,7 @@ pub(super) fn key(request: &Request) -> String {
         request.binary,
         request.cwd,
         request.provider_id,
+        request.settings.fork_from,
         request.model,
         settings,
         request.settings.environment,

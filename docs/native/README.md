@@ -18,6 +18,8 @@ runtime testing. See [preview limitations](parity.md).
 
 Fenced `mermaid` blocks render as native diagrams in Markdown previews and
 conversations. See [Mermaid diagrams](mermaid.md) for examples and limitations.
+
+Add your own panels, slash commands and menu items with [tweaks](tweaks.md).
 For interactive visuals, use `/visualize` in an idle local desktop conversation
 or ask a Mono directly. See [session visuals](visuals.md) and the
 [preview release notes](preview-release-notes.md).

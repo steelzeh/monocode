@@ -345,6 +345,8 @@ impl Shell {
         .detach();
     }
     pub(super) fn apply_preferences(&mut self, cx: &mut Context<Self>) {
+        self.sync_right_panel(cx);
+        self.invalidate_chrome(cx);
         self.refresh_notification_permission();
         self.configure_quick_composer(cx);
         // Switching search styles closes an open search of the other style.

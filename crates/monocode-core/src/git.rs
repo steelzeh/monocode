@@ -23,6 +23,20 @@ pub struct Worktree {
     #[serde(alias = "isMain")]
     pub main: bool,
     pub missing: bool,
+    /// The folder of the submodule this worktree belongs to. `None` for the
+    /// project's own worktrees.
+    #[serde(default)]
+    pub submodule: Option<String>,
+}
+impl Worktree {
+    /// Puts the submodule before `name`, because a task's worktrees often
+    /// share one branch name across repositories: `web: feat/login`.
+    pub fn in_repo(&self, name: String) -> String {
+        match &self.submodule {
+            Some(submodule) => format!("{submodule}: {name}"),
+            None => name,
+        }
+    }
 }
 #[derive(Clone, Debug, Default)]
 pub struct Snapshot {
@@ -189,12 +203,13 @@ pub fn snapshot(cwd: &Path) -> Result<Snapshot, String> {
             .ok()
             .map(|s| s.trim().to_owned())
     });
-    let trees = worktrees(cwd)?;
+    let mut trees = worktrees(cwd)?;
     let canonical = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_owned());
     let root = std::fs::canonicalize(root.trim()).unwrap_or(canonical);
     let linked = trees
         .iter()
         .any(|t| !t.main && std::fs::canonicalize(&t.path).ok().as_ref() == Some(&root));
+    trees.extend(submodule_worktrees(&root));
     let branches = git(
         cwd,
         &[
@@ -235,6 +250,63 @@ pub fn worktrees(cwd: &Path) -> Result<Vec<Worktree>, String> {
     if crate::files::remote::is_remote(cwd) {
         return remote::worktrees(cwd);
     }
+    list_worktrees(cwd)
+}
+/// Linked worktrees of the project's submodules. Git lists a worktree only
+/// under the repository that owns it, so the project's own list misses these.
+fn submodule_worktrees(root: &Path) -> Vec<Worktree> {
+    // Costs no process for the many projects without submodules.
+    if !root.join(".gitmodules").is_file() {
+        return Vec::new();
+    }
+    let Ok(config) = git(
+        root,
+        &[
+            "config",
+            "--file",
+            ".gitmodules",
+            "--null",
+            "--get-regexp",
+            r"^submodule\..*\.path$",
+        ],
+    ) else {
+        return Vec::new();
+    };
+    config
+        .split('\0')
+        .filter_map(|entry| entry.split_once('\n'))
+        .filter(|(_, folder)| has_linked_worktrees(&root.join(folder)))
+        .flat_map(|(_, folder)| {
+            // One broken submodule must not hide the project's own list.
+            list_worktrees(&root.join(folder))
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|tree| !tree.main)
+                .map(|mut tree| {
+                    tree.submodule = Some(folder.to_owned());
+                    tree
+                })
+        })
+        .collect()
+}
+/// Reads Git's own files. A submodule that was never fetched has no `.git`,
+/// and running `git worktree list` there would answer for the parent project.
+fn has_linked_worktrees(checkout: &Path) -> bool {
+    let dot_git = checkout.join(".git");
+    let git_dir = if dot_git.is_dir() {
+        dot_git
+    } else {
+        let Ok(text) = std::fs::read_to_string(&dot_git) else {
+            return false;
+        };
+        let Some(target) = text.trim().strip_prefix("gitdir:") else {
+            return false;
+        };
+        checkout.join(target.trim())
+    };
+    git_dir.join("worktrees").is_dir()
+}
+fn list_worktrees(cwd: &Path) -> Result<Vec<Worktree>, String> {
     let mut trees = Vec::new();
     let mut tree = Worktree::default();
     for field in git(cwd, &["worktree", "list", "--porcelain", "-z"])?.split('\0') {
@@ -358,7 +430,7 @@ pub fn create_project_worktree(
     if state
         .worktrees
         .iter()
-        .any(|tree| tree.branch.as_deref() == Some(branch))
+        .any(|tree| tree.submodule.is_none() && tree.branch.as_deref() == Some(branch))
     {
         return Err("This branch already has a working copy. Select it from the picker.".into());
     }
@@ -437,6 +509,117 @@ pub fn create_project_worktree(
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn committed_repo(path: &Path) {
+        std::fs::create_dir_all(path).unwrap();
+        git(path, &["init", "-b", "main"]).unwrap();
+        git(path, &["config", "user.name", "Native test"]).unwrap();
+        git(path, &["config", "user.email", "native@example.invalid"]).unwrap();
+        std::fs::write(path.join("file"), "base\n").unwrap();
+        git(path, &["add", "."]).unwrap();
+        git(
+            path,
+            &["-c", "commit.gpgsign=false", "commit", "-m", "Base"],
+        )
+        .unwrap();
+    }
+    /// A project with `web` as a submodule, as checked out by `git submodule add`.
+    fn project_with_submodule(root: &Path) -> PathBuf {
+        let library = root.join("library");
+        let project = root.join("project");
+        committed_repo(&library);
+        committed_repo(&project);
+        git(
+            &project,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "--",
+                &library.to_string_lossy(),
+                "web",
+            ],
+        )
+        .unwrap();
+        git(
+            &project,
+            &["-c", "commit.gpgsign=false", "commit", "-m", "Add web"],
+        )
+        .unwrap();
+        project
+    }
+    #[test]
+    fn submodule_worktrees_are_listed_and_keep_to_their_own_repository() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let project = project_with_submodule(&root);
+        assert_eq!(
+            snapshot(&project).unwrap().worktrees.len(),
+            1,
+            "a submodule's own checkout is not an extra working copy"
+        );
+        let copy = root.join("web-copy");
+        git(
+            &project.join("web"),
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature",
+                "--",
+                &copy.to_string_lossy(),
+                "HEAD",
+            ],
+        )
+        .unwrap();
+        let state = snapshot(&project).unwrap();
+        assert!(!state.linked);
+        assert_eq!(state.worktrees.len(), 2);
+        assert!(state.worktrees[0].main && state.worktrees[0].submodule.is_none());
+        let tree = &state.worktrees[1];
+        assert!(!tree.main && !tree.missing);
+        assert_eq!(Path::new(&tree.path), copy);
+        assert_eq!(tree.branch.as_deref(), Some("feature"));
+        assert_eq!(tree.submodule.as_deref(), Some("web"));
+        assert_eq!(tree.in_repo("feature".into()), "web: feature");
+
+        // The project's lock state and delete guard look in the right place.
+        assert!(!crate::worktree_management::status(&project, tree).0);
+        git(
+            &project.join("web"),
+            &["worktree", "lock", "--", &tree.path],
+        )
+        .unwrap();
+        assert!(crate::worktree_management::status(&project, tree).0);
+        assert!(crate::worktree_management::check(&project, &copy)
+            .unwrap_err()
+            .contains("web submodule"));
+        assert!(copy.is_dir());
+
+        // The same branch name in the project is a different branch.
+        let own = create_named_worktree(&project, "feature").unwrap();
+        assert_eq!(own.submodule, None);
+        assert_eq!(worktrees(&project).unwrap().len(), 2);
+    }
+    #[test]
+    fn a_submodule_that_was_never_fetched_is_skipped() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let project = project_with_submodule(&root);
+        git(
+            &project,
+            &["worktree", "add", "-b", "own", "--", "../own-copy", "HEAD"],
+        )
+        .unwrap();
+        git(&project, &["submodule", "deinit", "-f", "--", "web"]).unwrap();
+        let state = snapshot(&project).unwrap();
+        assert_eq!(
+            state.worktrees.len(),
+            2,
+            "no entries answered for the parent"
+        );
+        assert!(state.worktrees.iter().all(|tree| tree.submodule.is_none()));
+    }
     #[test]
     fn uncommitted_only_checks_the_sessions_paths_staged_or_unstaged() {
         let temp = tempfile::tempdir().unwrap();

@@ -17,6 +17,10 @@ use std::{
 pub const MEMORY_LIMIT_BYTES: usize = 16 * 1024 * 1024;
 const TREE_BYTES: usize = 1024 * 1024;
 const CALL_DEADLINE: Duration = Duration::from_millis(60);
+/// Tweaks are measured by the clock on a machine that may be busy compiling,
+/// so a normal script must not run out of time. A runaway one is still stopped.
+const TWEAK_CALL_DEADLINE: Duration = Duration::from_millis(250);
+const MAX_TWEAK_CALLS: usize = 16;
 
 /// An isolated program. Keep it alive to preserve state between native events.
 /// Field order ensures all persistent JS values are dropped before their VM.
@@ -25,6 +29,7 @@ pub struct VisualRuntime {
     context: Context,
     _runtime: Runtime,
     deadline: Rc<Cell<Instant>>,
+    budget: Duration,
     interrupted: Rc<Cell<bool>>,
     stopped: bool,
     current: Option<Node>,
@@ -32,11 +37,32 @@ pub struct VisualRuntime {
 
 impl VisualRuntime {
     pub fn new(source: &str) -> Result<Self, String> {
+        Self::start(source, None, false)
+    }
+
+    /// A tweak's panel: the same sandbox, plus a `tweak` object with the JSON
+    /// `context` and the actions the app reads through [`Self::take_actions`].
+    pub fn with_host(source: &str, context: &str) -> Result<Self, String> {
+        Self::start(source, Some(context), false)
+    }
+
+    /// A tweak's script: the same sandbox with no view. It registers handlers
+    /// on `tweak` and runs when the user clicks one of its menu items.
+    pub fn tweak_script(source: &str) -> Result<Self, String> {
+        Self::start(source, Some("{}"), true)
+    }
+
+    fn start(source: &str, host: Option<&str>, script: bool) -> Result<Self, String> {
         validate_source(source)?;
         let runtime = Runtime::new().map_err(|e| format!("Could not start visual runtime: {e}"))?;
         runtime.set_memory_limit(MEMORY_LIMIT_BYTES);
         runtime.set_max_stack_size(256 * 1024);
-        let deadline = Rc::new(Cell::new(Instant::now() + CALL_DEADLINE));
+        let budget = if host.is_some() {
+            TWEAK_CALL_DEADLINE
+        } else {
+            CALL_DEADLINE
+        };
+        let deadline = Rc::new(Cell::new(Instant::now() + budget));
         let interrupted = Rc::new(Cell::new(false));
         let interrupt_deadline = deadline.clone();
         let interrupt_flag = interrupted.clone();
@@ -53,16 +79,17 @@ impl VisualRuntime {
             let result = (|| -> rquickjs::Result<Persistent<Object<'static>>> {
                 let controller: Object = ctx.eval(include_str!("visual/sdk.js"))?;
                 let init: Function = controller.get("init")?;
-                init.call::<_, ()>((source,))?;
+                init.call::<_, ()>((source, host, script))?;
                 Ok(Persistent::save(&ctx, controller))
             })();
-            result.map_err(|e| execution_error(&ctx, e, &interrupted))
+            result.map_err(|e| execution_error(&ctx, e, &interrupted, budget))
         })?;
         Ok(Self {
             controller,
             context,
             _runtime: runtime,
             deadline,
+            budget,
             interrupted,
             stopped: false,
             current: None,
@@ -70,7 +97,97 @@ impl VisualRuntime {
     }
 
     pub fn render(&mut self) -> Result<Node, String> {
-        self.call("render", None)
+        self.call("render", Call::Plain)
+    }
+
+    /// After an error or timeout the program must be started again.
+    pub fn is_stopped(&self) -> bool {
+        self.stopped
+    }
+
+    /// Gives a tweak's panel fresh context. Its own state stays.
+    pub fn set_context(&mut self, context: &str) -> Result<Node, String> {
+        self.call("setContext", Call::Context(context))
+    }
+
+    /// Runs a script's handler for one of its menu items, with the chat as JSON.
+    pub fn run_menu(&mut self, entry: &str, chat: &str) -> Result<(), String> {
+        self.call_script("runMenu", entry, chat)
+    }
+
+    /// Hands the answer for an earlier request to the script's callback.
+    pub fn deliver(&mut self, request: u64, answer: &str) -> Result<(), String> {
+        self.call_script("deliver", &request.to_string(), answer)
+    }
+
+    fn call_script(&mut self, method: &str, first: &str, second: &str) -> Result<(), String> {
+        if self.stopped {
+            return Err("This tweak stopped after an error".into());
+        }
+        self.deadline.set(Instant::now() + self.budget);
+        self.interrupted.set(false);
+        let result = self.context.with(|ctx| {
+            let result = (|| -> rquickjs::Result<()> {
+                let controller = self.controller.clone().restore(&ctx)?;
+                let function: Function = controller.get(method)?;
+                function.call((first, second))
+            })();
+            result.map_err(|e| execution_error(&ctx, e, &self.interrupted, self.budget))
+        });
+        if result.is_err() {
+            self.stopped = true;
+        }
+        result
+    }
+
+    /// Runs a panel's refresh handlers and draws it again.
+    pub fn refresh_panel(&mut self) -> Result<Node, String> {
+        self.call("refresh", Call::Plain)
+    }
+
+    /// Gives a panel the answer to an earlier call, and draws it again.
+    pub fn deliver_to_panel(&mut self, request: u64, answer: &str) -> Result<Node, String> {
+        self.call("deliver", Call::Event(&request.to_string(), answer))
+    }
+
+    /// Ends a tweak the app has refused to keep running.
+    pub fn stop(&mut self) {
+        self.stopped = true;
+    }
+
+    /// Drains the app calls a tweak made. Rust parses them again, so a script
+    /// cannot invent a request the app does not understand.
+    pub fn take_calls(&mut self) -> Result<Vec<crate::tweaks::AppCall>, String> {
+        if self.stopped {
+            return Ok(Vec::new());
+        }
+        self.deadline.set(Instant::now() + self.budget);
+        self.interrupted.set(false);
+        let result = self
+            .context
+            .with(|ctx| {
+                let result = (|| -> rquickjs::Result<String> {
+                    let controller = self.controller.clone().restore(&ctx)?;
+                    let function: Function = controller.get("takeCalls")?;
+                    function.call(())
+                })();
+                result.map_err(|e| execution_error(&ctx, e, &self.interrupted, self.budget))
+            })
+            .and_then(|json| {
+                serde_json::from_str::<Vec<crate::tweaks::AppCall>>(&json)
+                    .map_err(|e| format!("Invalid tweak call: {e}"))
+            })
+            .and_then(|calls| {
+                if calls.len() > MAX_TWEAK_CALLS {
+                    Err("Too many tweak calls at once".to_owned())
+                } else {
+                    Ok(calls)
+                }
+            });
+        if result.is_err() {
+            self.stopped = true;
+        }
+        result
     }
 
     /// Dispatch only the current render's handler. Values are checked against the
@@ -88,25 +205,26 @@ impl VisualRuntime {
         if payload.len() > 32 * 1024 {
             return Err("Visual event payload is too large".into());
         }
-        self.call("dispatch", Some((handler, &payload)))
+        self.call("dispatch", Call::Event(handler, &payload))
     }
 
-    fn call(&mut self, method: &str, event: Option<(&str, &str)>) -> Result<Node, String> {
+    fn call(&mut self, method: &str, input: Call<'_>) -> Result<Node, String> {
         if self.stopped {
             return Err("Visual stopped after an execution error; reload it to continue".into());
         }
-        self.deadline.set(Instant::now() + CALL_DEADLINE);
+        self.deadline.set(Instant::now() + self.budget);
         self.interrupted.set(false);
         let result = self.context.with(|ctx| {
             let result = (|| -> rquickjs::Result<String> {
                 let controller = self.controller.clone().restore(&ctx)?;
                 let function: Function = controller.get(method)?;
-                match event {
-                    Some((handler, payload)) => function.call((handler, payload)),
-                    None => function.call(()),
+                match input {
+                    Call::Event(handler, payload) => function.call((handler, payload)),
+                    Call::Context(context) => function.call((context,)),
+                    Call::Plain => function.call(()),
                 }
             })();
-            result.map_err(|e| execution_error(&ctx, e, &self.interrupted))
+            result.map_err(|e| execution_error(&ctx, e, &self.interrupted, self.budget))
         });
         let result = result.and_then(|json| {
             if json.len() > TREE_BYTES {
@@ -123,6 +241,12 @@ impl VisualRuntime {
         }
         result
     }
+}
+
+enum Call<'a> {
+    Plain,
+    Event(&'a str, &'a str),
+    Context(&'a str),
 }
 
 fn validate_event(node: &Node, id: &str, value: &serde_json::Value) -> Option<Result<(), String>> {
@@ -230,11 +354,18 @@ fn execution_error(
     ctx: &rquickjs::Ctx<'_>,
     error: rquickjs::Error,
     interrupted: &Cell<bool>,
+    budget: Duration,
 ) -> String {
+    let timed_out = || {
+        format!(
+            "Visual execution exceeded its {} ms time budget",
+            budget.as_millis()
+        )
+    };
     if interrupted.get() {
         // Clear the exception without invoking an untrusted exception accessor.
         let _ = ctx.catch();
-        return "Visual execution exceeded its 60 ms time budget".into();
+        return timed_out();
     }
     let message = if error.is_exception() {
         let exception = ctx.catch();
@@ -249,7 +380,7 @@ fn execution_error(
     // the same interrupt deadline as the operation that threw the exception.
     if interrupted.get() {
         let _ = ctx.catch();
-        return "Visual execution exceeded its 60 ms time budget".into();
+        return timed_out();
     }
     format!(
         "Visual execution failed: {}",

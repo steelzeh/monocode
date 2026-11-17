@@ -49,7 +49,15 @@ pub(super) struct Code {
     hovered: bool,
     markers: Vec<MarkerHit>,
     hovered_marker: Option<usize>,
+    /// The error under the pointer, as its range in the text.
+    hovered_error: Option<(usize, usize)>,
+    error_hover: Option<Task<()>>,
+    shown_error: Option<ShownError>,
     affinity: Cell<Option<(usize, bool)>>,
+}
+struct ShownError {
+    message: String,
+    at: Point<Pixels>,
 }
 impl Code {
     fn new() -> Self {
@@ -82,8 +90,16 @@ impl Code {
             hovered: false,
             markers: Vec::new(),
             hovered_marker: None,
+            hovered_error: None,
+            error_hover: None,
+            shown_error: None,
             affinity: Cell::new(None),
         }
+    }
+    fn clear_error_hover(&mut self) {
+        self.hovered_error = None;
+        self.error_hover = None;
+        self.shown_error = None;
     }
     fn row(&self, offset: usize) -> usize {
         self.offsets
@@ -594,13 +610,107 @@ impl Input {
             cx.notify();
         }
     }
-    pub(crate) fn set_editor_analysis(&mut self, analysis: Analysis, cx: &mut Context<Self>) {
+    pub(crate) fn set_editor_analysis(&mut self, mut analysis: Analysis, cx: &mut Context<Self>) {
         if let Some(code) = &mut self.code {
             code.folded.retain(|fold| analysis.folds.contains(fold));
+            analysis.diagnostics.extend(
+                code.analysis
+                    .diagnostics
+                    .iter()
+                    .filter(|d| d.server)
+                    .cloned(),
+            );
             code.analysis = Arc::new(analysis);
             code.layout_width = None;
             cx.notify();
         }
+    }
+    /// Replaces the errors from the language server for the current text.
+    pub(crate) fn set_server_errors(
+        &mut self,
+        errors: Vec<crate::editor_analysis::Diagnostic>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(code) = &mut self.code {
+            let analysis = Arc::make_mut(&mut code.analysis);
+            analysis.diagnostics.retain(|d| !d.server);
+            analysis.diagnostics.extend(errors);
+            code.layout_width = None;
+            code.clear_error_hover();
+            cx.notify();
+        }
+    }
+    /// Shows the message of the error under the pointer, after a short rest.
+    /// The window reports every pointer move, so this also sees it leave.
+    pub(super) fn code_error_hover(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let Some(bounds) = self.bounds else {
+            return;
+        };
+        let at =
+            (bounds.contains(&position) && !self.selecting).then(|| self.mouse_index(position));
+        let Some(code) = &mut self.code else {
+            return;
+        };
+        let found = at.and_then(|at| {
+            code.analysis
+                .diagnostics
+                .iter()
+                .filter(|d| d.range().contains(&at))
+                .max_by_key(|d| d.priority())
+                .cloned()
+        });
+        let range = found.as_ref().map(|d| (d.from, d.to));
+        if code.hovered_error == range {
+            return;
+        }
+        if code.shown_error.is_some() {
+            cx.notify();
+        }
+        code.clear_error_hover();
+        code.hovered_error = range;
+        let Some(found) = found else {
+            return;
+        };
+        let at = position + point(px(0.), px(16.));
+        code.error_hover = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(300))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if let Some(code) = &mut this.code {
+                    code.shown_error = Some(ShownError {
+                        message: found.message,
+                        at,
+                    });
+                    cx.notify();
+                }
+            });
+        }));
+    }
+    pub(super) fn error_tooltip(&self) -> Option<AnyElement> {
+        let shown = self.code.as_ref()?.shown_error.as_ref()?;
+        Some(
+            gpui::deferred(
+                gpui::anchored()
+                    .position(shown.at)
+                    .snap_to_window_with_margin(px(8.))
+                    .child(
+                        div()
+                            .max_w(px(480.))
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .bg(crate::theme::pane_fill())
+                            .border_1()
+                            .border_color(crate::theme::content(0.14))
+                            .text_size(px(12.))
+                            .text_color(crate::theme::content(1.))
+                            .child(shown.message.clone()),
+                    ),
+            )
+            .with_priority(20)
+            .into_any_element(),
+        )
     }
     pub(crate) fn cursor_location(&self) -> (usize, usize) {
         let at = self.cursor();
@@ -709,6 +819,7 @@ impl Input {
             code.completion_source = None;
             code.deleted_rows.clear();
             code.hovered_change = None;
+            code.clear_error_hover();
             code.offsets = std::iter::once(0)
                 .chain(self.content.match_indices('\n').map(|(at, _)| at + 1))
                 .collect();
@@ -952,6 +1063,7 @@ impl Input {
         cx: &mut Context<Self>,
     ) {
         if let Some(code) = &mut self.code {
+            code.clear_error_hover();
             let delta = e.delta.pixel_delta(px(self.line_height));
             let height = self.bounds.map_or(px(0.), |b| b.size.height);
             self.scroll_y = (self.scroll_y - delta.y)
@@ -1545,7 +1657,14 @@ fn shape(i: &Input, row: usize, width: Option<Pixels>, w: &mut Window) -> Wrappe
                 decorated.push(TextRun {
                     len: b - a,
                     underline: Some(UnderlineStyle {
-                        color: Some(rgb(0xf87171).into()),
+                        color: Some(
+                            rgb(match diagnostic.severity.as_str() {
+                                "warning" => 0xfbbf24,
+                                "info" => 0x60a5fa,
+                                _ => 0xf87171,
+                            })
+                            .into(),
+                        ),
                         thickness: px(1.),
                         wavy: true,
                     }),
@@ -1784,6 +1903,12 @@ impl Element for CodeElement {
         cx: &mut App,
     ) {
         paint_drag_listener(&self.input, w, cx);
+        let input = self.input.clone();
+        w.on_mouse_event(move |e: &MouseMoveEvent, phase, _, cx| {
+            if phase == gpui::DispatchPhase::Bubble {
+                input.update(cx, |input, cx| input.code_error_hover(e.position, cx));
+            }
+        });
         let i = self.input.read(cx);
         let code = i.code.as_ref().unwrap();
         let lh = i.line_height();
@@ -2178,6 +2303,7 @@ mod tests {
                 i.set_editor_analysis(
                     Analysis {
                         diagnostics: vec![Diagnostic {
+                            server: false,
                             from: diagnostic,
                             to: diagnostic + 4,
                             severity: "error".into(),
@@ -2253,6 +2379,150 @@ mod tests {
                 assert!(!i.selecting);
             })
             .unwrap();
+    }
+    fn server_error(from: usize, to: usize) -> crate::editor_analysis::Diagnostic {
+        crate::editor_analysis::Diagnostic {
+            from,
+            to,
+            severity: "error".into(),
+            message: "Bad type. ts(2322)".into(),
+            server: true,
+        }
+    }
+    fn server_ranges(input: &Input) -> Vec<(usize, usize)> {
+        input
+            .editor_analysis()
+            .diagnostics
+            .iter()
+            .filter(|d| d.server)
+            .map(|d| (d.from, d.to))
+            .collect()
+    }
+    #[gpui::test]
+    fn server_errors_move_with_the_text_and_leave_when_an_edit_touches_them(
+        cx: &mut TestAppContext,
+    ) {
+        let window = cx.update(|cx| {
+            bind(cx);
+            cx.open_window(Default::default(), |_, cx| cx.new(Input::editor))
+                .unwrap()
+        });
+        window
+            .update(cx, |i, _, cx| {
+                i.set_text("const value = 1;".into(), cx);
+                i.set_server_errors(vec![server_error(6, 11)], cx);
+                assert_eq!(server_ranges(i), [(6, 11)]);
+                i.replace_bytes(0..0, "// x\n", 0, cx);
+                assert_eq!(server_ranges(i), [(11, 16)], "moved after the new line");
+                i.replace_bytes(i.content.len()..i.content.len(), "\n", 0, cx);
+                assert_eq!(
+                    server_ranges(i),
+                    [(11, 16)],
+                    "an edit after it changes nothing"
+                );
+                i.set_editor_analysis(Default::default(), cx);
+                assert_eq!(
+                    server_ranges(i),
+                    [(11, 16)],
+                    "the app's own check keeps them"
+                );
+                i.replace_bytes(13..13, "x", 0, cx);
+                assert!(server_ranges(i).is_empty(), "an edit inside removes it");
+            })
+            .unwrap();
+    }
+    #[gpui::test]
+    fn new_server_errors_replace_only_the_old_server_errors(cx: &mut TestAppContext) {
+        let window = cx.update(|cx| {
+            bind(cx);
+            cx.open_window(Default::default(), |_, cx| cx.new(Input::editor))
+                .unwrap()
+        });
+        window
+            .update(cx, |i, _, cx| {
+                i.set_text("const value = 1;".into(), cx);
+                let mut own = server_error(0, 5);
+                own.server = false;
+                i.set_editor_analysis(
+                    Analysis {
+                        diagnostics: vec![own],
+                        ..Default::default()
+                    },
+                    cx,
+                );
+                i.set_server_errors(vec![server_error(6, 11)], cx);
+                i.set_server_errors(vec![server_error(14, 15)], cx);
+                assert_eq!(server_ranges(i), [(14, 15)]);
+                assert_eq!(i.editor_analysis().diagnostics.len(), 2);
+            })
+            .unwrap();
+    }
+    #[gpui::test]
+    fn resting_the_pointer_on_underlined_code_shows_the_message(cx: &mut TestAppContext) {
+        let window = cx.update(|cx| {
+            bind(cx);
+            cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                        point(px(0.), px(0.)),
+                        size(px(800.), px(600.)),
+                    ))),
+                    ..Default::default()
+                },
+                |_, cx| cx.new(Input::editor),
+            )
+            .unwrap()
+        });
+        window
+            .update(cx, |i, _, cx| {
+                i.set_text("const value = 1;\nsecond line".into(), cx);
+                i.set_server_errors(vec![server_error(6, 11)], cx);
+            })
+            .unwrap();
+        let mut visual = gpui::VisualTestContext::from_window(*window, cx);
+        visual.run_until_parked();
+        visual.update(|window, cx| {
+            window.refresh();
+            let _ = cx;
+        });
+        visual.run_until_parked();
+        let shown = |visual: &mut gpui::VisualTestContext| {
+            window
+                .update(visual, |i, _, _| {
+                    i.code
+                        .as_ref()
+                        .unwrap()
+                        .shown_error
+                        .as_ref()
+                        .map(|s| s.message.clone())
+                })
+                .unwrap()
+        };
+        let on_error = window
+            .update(&mut visual, |i, _, _| {
+                i.bounds.unwrap().origin + i.position(8) + point(px(1.), px(6.))
+            })
+            .unwrap();
+        let off_error = window
+            .update(&mut visual, |i, _, _| {
+                i.bounds.unwrap().origin + i.position(20) + point(px(1.), px(6.))
+            })
+            .unwrap();
+        visual.simulate_mouse_move(on_error, None, Default::default());
+        visual.run_until_parked();
+        assert_eq!(shown(&mut visual), None, "it waits for the pointer to rest");
+        visual
+            .executor()
+            .advance_clock(std::time::Duration::from_millis(400));
+        visual.run_until_parked();
+        assert_eq!(shown(&mut visual).as_deref(), Some("Bad type. ts(2322)"));
+        visual.simulate_mouse_move(off_error, None, Default::default());
+        visual.run_until_parked();
+        assert_eq!(
+            shown(&mut visual),
+            None,
+            "it goes away when the pointer leaves"
+        );
     }
     #[gpui::test]
     fn drag_selection_keeps_scrolling_past_the_viewport_edge(cx: &mut TestAppContext) {

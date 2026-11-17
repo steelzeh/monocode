@@ -70,7 +70,7 @@ impl Store {
     }
     /// Every block, numbered from the first. Only whole-history readers such as
     /// search use this; row indices it implies are not the window's.
-    pub(super) fn shared_all_blocks(&self, id: i64) -> Result<Vec<Value>, String> {
+    pub(in crate::store) fn shared_all_blocks(&self, id: i64) -> Result<Vec<Value>, String> {
         let original = self.persisted_session_id(id)?;
         if self.shared_indexed(&original)? {
             self.shared_indexed_blocks(&original, 0, i64::MAX)

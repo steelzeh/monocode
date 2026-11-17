@@ -29,11 +29,93 @@ impl Conversation {
             self.open_btw(question, false, cx);
             return true;
         }
+        if let Some(prompt) = self.tweak_command(&text, cx) {
+            self.run_tweak_prompt(text, prompt, true, cx);
+            return true;
+        }
         if !text.eq_ignore_ascii_case("/compact") {
             return false;
         }
         self.compact_context(cx);
         true
+    }
+
+    /// A tweak's prompt for this `/command`, unless the agent has its own.
+    fn tweak_command(&self, text: &str, cx: &Context<Self>) -> Option<String> {
+        let name = text.strip_prefix('/')?.split_whitespace().next()?;
+        if self.completion.read(cx).has_user_command(name) {
+            return None;
+        }
+        let prompt = crate::tweaks::command_prompt(text, cx)?;
+        Some(self.completion.read(cx).prepare_prompt(&prompt))
+    }
+
+    /// Sends a tweak's prompt. The chat shows `shown`, the agent gets `prompt`.
+    pub(crate) fn run_tweak_prompt(
+        &mut self,
+        shown: String,
+        prompt: String,
+        from_composer: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if from_composer && self.input.read(cx).is_composing() {
+            return;
+        }
+        if !self.history_ready() {
+            self.defer_history_action(
+                move |this, cx| this.run_tweak_prompt(shown, prompt, from_composer, cx),
+                cx,
+            );
+            return;
+        }
+        if self.busy || self.stopping || !self.follow_ups.state.messages.is_empty() {
+            self.status = "Wait for the current turn and queued messages first.".into();
+            cx.notify();
+            return;
+        }
+        if self.attaching
+            || self.account_switching
+            || self.preparing_worktree
+            || self.is_remote()
+            || self.settings.mono.is_some()
+            || self.settings.worktree_removed
+        {
+            self.status = "This tweak is not available in this session.".into();
+            cx.notify();
+            return;
+        }
+        let attachments = if from_composer {
+            std::mem::take(&mut self.attachments)
+        } else {
+            Vec::new()
+        };
+        let mut message = self.message(shown, attachments, None, cx);
+        message.prepared_prompt = Some(prompt);
+        if from_composer {
+            self.input.update(cx, |input, cx| {
+                input.take(cx);
+            });
+            self.completion
+                .update(cx, |completion, cx| completion.dismiss(cx));
+        }
+        self.launch_message(message, cx);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn composer_text_for_test(&self, cx: &gpui::App) -> String {
+        self.input.read(cx).content.to_string()
+    }
+
+    /// Adds text to the message box. What you already wrote stays.
+    pub(crate) fn insert_composer_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        let current = self.input.read(cx).content.clone();
+        let next = if current.trim().is_empty() {
+            text.to_owned()
+        } else {
+            format!("{current}\n\n{text}")
+        };
+        self.input.update(cx, |input, cx| input.set_text(next, cx));
+        cx.notify();
     }
 
     fn visualize_command(&mut self, text: &str, request: &str, cx: &mut Context<Self>) {
@@ -321,6 +403,82 @@ mod tests {
                         .map(|row| row.text.as_str())
                         .collect::<String>(),
                     "/Visualize Compare the two approaches"
+                );
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn a_tweak_command_starts_a_turn_and_is_ignored_while_the_tweak_is_off(
+        cx: &mut TestAppContext,
+    ) {
+        use monocode_core::tweaks::{Found, Tweak};
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let mut summary = store.create("codex", "/missing/tweak-command").unwrap();
+        summary.provider = "fixture".into();
+        let store = Arc::new(Mutex::new(store));
+        let tweak = Tweak {
+            manifest: serde_json::from_value(serde_json::json!({
+                "id": "t", "name": "T", "version": "1",
+                "commands": [{"name": "standup", "prompt": "Write about {{args}}"}]
+            }))
+            .unwrap(),
+            dir: PathBuf::from("/tweaks/t"),
+            panel_source: None,
+            script_source: None,
+            fingerprint: String::new(),
+            source: None,
+        };
+        let shown = tweak.clone();
+        let window = cx.update(|cx| {
+            input::bind(cx);
+            crate::popover::bind(cx);
+            crate::tweaks::install(store.clone(), cx);
+            let center = crate::tweaks::get(cx).unwrap();
+            center.update(cx, |center, cx| {
+                center.set_found(vec![Found::Ready(shown)], cx)
+            });
+            cx.open_window(Default::default(), |_, cx| {
+                cx.new(|cx| {
+                    let mut view = Conversation::new(summary, store.clone(), cx);
+                    view.loaded = true;
+                    view.summary.has_messages = true;
+                    view
+                })
+            })
+            .unwrap()
+        });
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        window
+            .update(visual, |view, _, cx| {
+                view.input
+                    .update(cx, |input, cx| input.set_text("/standup today".into(), cx));
+                assert!(!view.handle_local_command(cx), "the tweak is off");
+                let center = crate::tweaks::get(cx).unwrap();
+                center.update(cx, |center, cx| center.set_enabled(&tweak, true, cx));
+
+                view.completion.update(cx, |completion, _| {
+                    completion.add_short_mention_for_test("@notes.md", "@docs/notes.md")
+                });
+                let prompt = view.tweak_command("/standup @notes.md", cx).unwrap();
+                assert_eq!(prompt, "Write about @docs/notes.md");
+
+                view.busy = true;
+                view.send(cx);
+                assert_eq!(view.input.read(cx).content, "/standup today");
+                assert!(view.status.contains("Wait for the current turn"));
+
+                view.busy = false;
+                view.send(cx);
+                assert!(view.busy);
+                assert!(view.input.read(cx).content.is_empty());
+                let rows = view.transcript.read(cx).source_rows();
+                assert_eq!(
+                    rows.iter()
+                        .filter(|row| row.is_prompt())
+                        .map(|row| row.text.as_str())
+                        .collect::<String>(),
+                    "/standup today"
                 );
             })
             .unwrap();

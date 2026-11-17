@@ -29,6 +29,7 @@ mod fixtures;
 mod fonts;
 mod frame_log;
 mod fs_watch;
+mod language_tools;
 mod git_cache;
 mod git_graph;
 mod git_picker;
@@ -73,6 +74,7 @@ mod resource_pressure;
 mod response_actions;
 mod reveal;
 mod review;
+mod review_bar;
 mod right_panel;
 mod runtime;
 mod search;
@@ -91,12 +93,15 @@ mod theme;
 #[cfg(target_os = "macos")]
 mod traffic_lights;
 mod transcript;
+mod tweaks;
 mod usage_footer;
 mod visuals;
 #[cfg(test)]
 mod wheel_glide_tests;
 mod window_state;
 mod workspace;
+mod workspace_changes;
+mod workspace_folders;
 mod worktree_switcher;
 
 use gpui::{App, KeyBinding, TitlebarOptions, WindowOptions, actions, point, prelude::*, px, size};
@@ -191,6 +196,13 @@ fn main() {
     }
     if cli_args.first().is_some_and(|a| a == "visual-mcp") {
         if let Err(error) = monocode_core::visual_bridge::mcp_stdio() {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if cli_args.first().is_some_and(|a| a == "chat-mcp") {
+        if let Err(error) = monocode_core::mono::bridge::chat_mcp_stdio() {
             eprintln!("{error}");
             std::process::exit(1);
         }
@@ -430,6 +442,9 @@ fn main() {
             #[cfg(target_os = "macos")]
             hang_watchdog::start(database.with_file_name("gpui-hangs"), cx);
             input::bind(cx);
+            if let Some(data) = database.parent() {
+                language_tools::install(data, cx);
+            }
             image_lightbox::bind(cx);
             composer_completion::bind(cx);
             file_editor::bind(cx);

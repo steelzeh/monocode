@@ -135,6 +135,11 @@ pub(crate) struct FileEditor {
     git_line_ending: &'static str,
     git_task: Option<Task<()>>,
     analysis: Option<Task<()>>,
+    /// This file's place on a language server, if one handles it.
+    language: Option<monocode_core::language_server::Document>,
+    language_updates: Option<Task<()>>,
+    language_send: Option<Task<()>>,
+    language_note: Option<String>,
     /// The Tree-sitter parser and last tree, reused by each incremental pass.
     syntax: Arc<std::sync::Mutex<Option<crate::editor_syntax::Session>>>,
     focus: FocusHandle,
@@ -280,6 +285,10 @@ impl FileEditor {
             git_line_ending: "\n",
             git_task: None,
             analysis: None,
+            language: None,
+            language_updates: None,
+            language_send: None,
+            language_note: None,
             syntax: Default::default(),
             focus: cx.focus_handle(),
             input,
@@ -605,7 +614,68 @@ impl FileEditor {
             });
         }));
     }
+    /// Sends the text to the language server after a short pause in typing.
+    fn schedule_language_check(&mut self, cx: &mut Context<Self>) {
+        if self.language.is_none() {
+            let Some((document, updates)) = cx
+                .try_global::<crate::language_tools::LanguageTools>()
+                .and_then(|tools| {
+                    tools.open(
+                        std::path::Path::new(&self.path),
+                        std::path::Path::new(&self.cwd),
+                    )
+                })
+            else {
+                return;
+            };
+            self.language = Some(document);
+            self.language_updates = Some(cx.spawn(async move |this, cx| {
+                while let Ok(update) = updates.recv().await {
+                    let applied =
+                        this.update(cx, |this, cx| this.apply_language_update(update, cx));
+                    if applied.is_err() {
+                        break;
+                    }
+                }
+            }));
+        }
+        self.language_send = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(crate::language_tools::TYPING_PAUSE)
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                let text = this.input.read(cx).content.clone();
+                if let (Some(document), true) = (
+                    &this.language,
+                    text.len() <= crate::language_tools::MAX_TEXT,
+                ) {
+                    document.set_text(text.as_ref().into());
+                }
+            });
+        }));
+    }
+    fn apply_language_update(
+        &mut self,
+        update: monocode_core::language_server::Update,
+        cx: &mut Context<Self>,
+    ) {
+        use monocode_core::language_server::Update;
+        match update {
+            Update::Errors { text, errors } => {
+                if self.input.read(cx).content.as_ref() == &*text {
+                    let errors = crate::language_tools::diagnostics(errors);
+                    self.input
+                        .update(cx, |input, cx| input.set_server_errors(errors, cx));
+                }
+            }
+            Update::Note(note) => {
+                self.language_note = note;
+                cx.notify();
+            }
+        }
+    }
     fn schedule_analysis(&mut self, cx: &mut Context<Self>) {
+        self.schedule_language_check(cx);
         let text = self.input.read(cx).content.clone();
         let original = self.git_original.clone();
         let path = self.path.clone();
@@ -684,24 +754,40 @@ impl FileEditor {
         let source = self.input.read(cx).content.clone();
         let at = self.input.read(cx).selection_range().end;
         let path = self.path.clone();
+        let project = self.cwd.clone();
+        self.error = None;
         self.formatting = Some(cx.spawn(async move |this, cx| {
             let text = source.clone();
             let result = cx
                 .background_executor()
-                .spawn(async move { crate::editor_analysis::format(&path, &text, at) })
+                .spawn(async move { crate::editor_analysis::format(&path, &text, at, &project) })
                 .await;
-            let _ = this.update(cx, |this, cx| {
-                if this.input.read(cx).content == source
-                    && !this.input.read(cx).is_composing()
-                    && let Ok(Some(result)) = result
-                    && result.formatted != source.as_ref()
-                {
-                    this.input.update(cx, |input, cx| {
-                        input.replace_bytes(0..source.len(), &result.formatted, result.cursor, cx)
-                    });
-                }
-            });
+            let _ = this.update(cx, |this, cx| this.apply_format(&source, result, cx));
         }));
+    }
+    /// Puts a format result in the editor, unless the text changed meanwhile.
+    fn apply_format(
+        &mut self,
+        source: &SharedString,
+        format: Result<crate::editor_analysis::Format, String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Ok(format) = format else {
+            return;
+        };
+        if format.note.is_some() {
+            self.error = format.note;
+            cx.notify();
+        }
+        if self.input.read(cx).content == *source
+            && !self.input.read(cx).is_composing()
+            && let Some(result) = format.result
+            && result.formatted != source.as_ref()
+        {
+            self.input.update(cx, |input, cx| {
+                input.replace_bytes(0..source.len(), &result.formatted, result.cursor, cx)
+            });
+        }
     }
     pub(crate) fn save(&mut self, cx: &mut Context<Self>) {
         if self.saving || self.input.read(cx).is_composing() || self.document.is_none() {
@@ -710,6 +796,7 @@ impl FileEditor {
         let source = self.input.read(cx).content.clone();
         let at = self.input.read(cx).selection_range().end;
         let path = self.path.clone();
+        let project = self.cwd.clone();
         let format = cx
             .try_global::<crate::settings::Preferences>()
             .is_none_or(|p| p.format_on_save);
@@ -720,24 +807,11 @@ impl FileEditor {
                 let text = source.clone();
                 let result = cx
                     .background_executor()
-                    .spawn(async move { crate::editor_analysis::format(&path, &text, at) })
+                    .spawn(
+                        async move { crate::editor_analysis::format(&path, &text, at, &project) },
+                    )
                     .await;
-                let _ = this.update(cx, |this, cx| {
-                    if this.input.read(cx).content == source
-                        && !this.input.read(cx).is_composing()
-                        && let Ok(Some(result)) = result
-                        && result.formatted != source.as_ref()
-                    {
-                        this.input.update(cx, |input, cx| {
-                            input.replace_bytes(
-                                0..source.len(),
-                                &result.formatted,
-                                result.cursor,
-                                cx,
-                            )
-                        });
-                    }
-                });
+                let _ = this.update(cx, |this, cx| this.apply_format(&source, result, cx));
             }
             let Ok(Some((path, doc, saved))) = this.update(cx, |this, cx| {
                 if this.input.read(cx).is_composing() {
@@ -1226,10 +1300,14 @@ impl gpui::Render for FileEditor {
             })
             .when(self.search_open, |d| d.child(self.search_panel(cx)))
             .when_some(
-                self.error.clone().filter(|_| ready).or_else(|| {
-                    self.disk_changed
-                        .then(|| "File changed on disk. Reload to use the new version.".into())
-                }),
+                self.error
+                    .clone()
+                    .filter(|_| ready)
+                    .or_else(|| {
+                        self.disk_changed
+                            .then(|| "File changed on disk. Reload to use the new version.".into())
+                    })
+                    .or_else(|| self.language_note.clone().filter(|_| ready)),
                 |d, error| {
                     d.child(
                         div()

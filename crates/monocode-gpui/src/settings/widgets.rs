@@ -243,6 +243,19 @@ impl SettingsView {
         description: Option<SharedString>,
         controls: Vec<AnyElement>,
     ) -> AnyElement {
+        self.row_with_details(id, first, label, description, None, controls)
+    }
+
+    /// A row with extra content under its description.
+    pub(super) fn row_with_details(
+        &self,
+        id: Option<&'static str>,
+        first: bool,
+        label: impl IntoElement,
+        description: Option<SharedString>,
+        details: Option<AnyElement>,
+        controls: Vec<AnyElement>,
+    ) -> AnyElement {
         let flash = self.flashing(id);
         let narrow =
             self.scroll.bounds().size.width > px(0.) && self.scroll.bounds().size.width < px(560.);
@@ -316,7 +329,8 @@ impl SettingsView {
                                 .text_color(content(0.45))
                                 .child(text),
                         )
-                    }),
+                    })
+                    .children(details),
             )
             .child(
                 div()
@@ -360,13 +374,14 @@ impl SettingsView {
     /// Toggle: a 36×20 switch with a 16px knob.
     pub(super) fn toggle(
         &self,
-        id: &'static str,
+        id: impl Into<SharedString>,
         label: impl Into<SharedString>,
         on: bool,
         disabled: bool,
         cx: &mut Context<Self>,
         change: impl Fn(&mut Self, bool, &mut Context<Self>) + 'static,
     ) -> AnyElement {
+        let id = id.into();
         div()
             .id(SharedString::from(format!("toggle-{id}")))
             .debug_selector(move || format!("settings-toggle-{id}"))

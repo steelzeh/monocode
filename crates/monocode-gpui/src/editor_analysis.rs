@@ -28,6 +28,10 @@ pub(crate) struct Diagnostic {
     pub to: usize,
     pub severity: String,
     pub message: String,
+    /// Came from a language server, which answers less often than the app's
+    /// own check, so these stay when the app's own results are replaced.
+    #[serde(default)]
+    pub server: bool,
 }
 #[derive(Clone, Debug, Deserialize)]
 pub(crate) struct Change {
@@ -166,14 +170,58 @@ pub(crate) fn chunk_action(
         .map_err(|e| e.to_string())?;
     serde_json::from_str(&json).map_err(|e| e.to_string())
 }
-pub(crate) fn format(path: &str, source: &str, at: usize) -> Result<Option<Formatted>, String> {
-    transform(
-        "monocodeFormat",
-        path,
-        source,
-        at,
-        include_str!("../assets/native-format.js"),
-    )
+/// The result of formatting one file with its project's Prettier settings.
+#[derive(Debug, Default)]
+pub(crate) struct Format {
+    pub result: Option<Formatted>,
+    /// One line for the user when the project's settings stopped the format.
+    pub note: Option<String>,
+}
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum FormatReply {
+    Blocked { blocked: String },
+    Formatted(Formatted),
+}
+pub(crate) fn format(path: &str, source: &str, at: usize, project: &str) -> Result<Format, String> {
+    let settings = monocode_core::project_tools::prettier_config::find(
+        std::path::Path::new(path),
+        std::path::Path::new(project),
+    );
+    let settings = serde_json::to_string(&settings).map_err(|e| e.to_string())?;
+    format_with_settings(path, source, at, &settings)
+}
+fn format_with_settings(
+    path: &str,
+    source: &str,
+    at: usize,
+    settings: &str,
+) -> Result<Format, String> {
+    let (_runtime, context) = runtime()?;
+    let json = context
+        .with(|ctx| -> rquickjs::Result<String> {
+            ctx.eval::<(), _>(include_str!("../assets/native-format.js"))?;
+            let function: Function = ctx.globals().get("monocodeFormat")?;
+            function
+                .call::<_, Promise>((path, source, utf16(source, at), settings))?
+                .finish()
+        })
+        .map_err(|e| e.to_string())?;
+    let reply: Option<FormatReply> = serde_json::from_str(&json).map_err(|e| e.to_string())?;
+    Ok(match reply {
+        None => Format::default(),
+        Some(FormatReply::Blocked { blocked }) => Format {
+            result: None,
+            note: Some(blocked),
+        },
+        Some(FormatReply::Formatted(mut result)) => {
+            result.cursor = byte(&result.formatted, result.cursor);
+            Format {
+                result: Some(result),
+                note: None,
+            }
+        }
+    })
 }
 pub(crate) fn emmet(path: &str, source: &str, at: usize) -> Result<Option<Formatted>, String> {
     transform(
@@ -196,7 +244,7 @@ fn transform(
         .with(|ctx| -> rquickjs::Result<String> {
             ctx.eval::<(), _>(bundle)?;
             let function: Function = ctx.globals().get(name)?;
-            if name == "monocodeFormat" || name == "monocodeEmmet" {
+            if name == "monocodeEmmet" {
                 function
                     .call::<_, Promise>((path, source, utf16(source, at)))?
                     .finish()
@@ -301,6 +349,10 @@ impl Analysis {
             .diagnostics
             .iter()
             .filter_map(|d| {
+                // The next answer from the server replaces what an edit touched.
+                if d.server && d.to > edit.start && d.from < edit.old_end {
+                    return None;
+                }
                 let (from, to) = edit.map(d.from, d.to)?;
                 Some(Diagnostic {
                     from,
@@ -479,11 +531,185 @@ mod parity_tests {
             "$1"
         );
     }
+    fn one_config(name: &str, text: &str) -> String {
+        serde_json::json!({"config": {"name": name, "folder": "/p", "text": text}}).to_string()
+    }
+    fn formatted(path: &str, source: &str, settings: &str) -> String {
+        format_with_settings(path, source, 0, settings)
+            .unwrap()
+            .result
+            .unwrap()
+            .formatted
+    }
+    fn note(path: &str, source: &str, settings: &str) -> String {
+        format_with_settings(path, source, 0, settings)
+            .unwrap()
+            .note
+            .unwrap()
+    }
+    #[test]
+    fn prettier_reads_every_data_settings_format() {
+        for (name, text) in [
+            (".prettierrc", "singleQuote: true"),
+            (".prettierrc", r#"{"singleQuote": true}"#),
+            (".prettierrc.json", r#"{"$schema":"x","singleQuote": true}"#),
+            (".prettierrc.yaml", "singleQuote: true"),
+            (".prettierrc.yml", "singleQuote: true"),
+            (".prettierrc.json5", "{singleQuote: true, /* note */}"),
+            (".prettierrc.toml", "singleQuote = true"),
+            ("package.json", r#"{"prettier":{"singleQuote":true}}"#),
+            ("package.yaml", "prettier:\n  singleQuote: true\n"),
+        ] {
+            assert_eq!(
+                formatted("/p/a.ts", "const a = \"x\"", &one_config(name, text)),
+                "const a = 'x';\n",
+                "{name}"
+            );
+        }
+    }
+    #[test]
+    fn prettier_print_width_comes_from_the_settings() {
+        let long = "const value = call(firstArgumentName, secondArgumentName, thirdArgumentName, fourth);\n";
+        assert_eq!(
+            formatted(
+                "/p/a.ts",
+                long,
+                &one_config(".prettierrc", "printWidth: 120")
+            ),
+            long
+        );
+        assert_ne!(formatted("/p/a.ts", long, "{}"), long);
+    }
+    #[test]
+    fn prettier_overrides_follow_file_patterns() {
+        let settings = one_config(
+            ".prettierrc.json",
+            r#"{"overrides":[
+                {"files":"*.test.ts","options":{"singleQuote":true}},
+                {"files":["legacy/**/*.ts"],"excludeFiles":"legacy/keep.ts","options":{"semi":false}}
+            ]}"#,
+        );
+        let source = "const a = \"x\";";
+        assert_eq!(
+            formatted("/p/src/a.test.ts", source, &settings),
+            "const a = 'x';\n"
+        );
+        assert_eq!(
+            formatted("/p/src/a.ts", source, &settings),
+            "const a = \"x\";\n"
+        );
+        assert_eq!(
+            formatted("/p/legacy/b.ts", source, &settings),
+            "const a = \"x\"\n"
+        );
+        assert_eq!(
+            formatted("/p/legacy/keep.ts", source, &settings),
+            "const a = \"x\";\n"
+        );
+    }
+    #[test]
+    fn prettier_ignore_leaves_a_file_alone_without_a_note() {
+        let ignore = serde_json::json!({
+            "ignore": {"name": ".prettierignore", "folder": "/p", "text": "# copied\nmodules/\n"},
+            "unusable": "prettier.config.js is code",
+        })
+        .to_string();
+        let result = format_with_settings("/p/modules/x/a.ts", "const a=1", 0, &ignore).unwrap();
+        assert!(result.result.is_none());
+        assert!(result.note.is_none());
+        assert!(note("/p/src/a.ts", "const a=1", &ignore).contains("prettier.config.js"));
+    }
+    #[test]
+    fn editorconfig_sets_options_and_prettier_settings_win() {
+        let files = serde_json::json!([
+            {"name": ".editorconfig", "folder": "/p/api", "text": "[*.ts]\nindent_style = tab\n[*.md]\nindent_size = 1\n"},
+            {"name": ".editorconfig", "folder": "/p", "text": "root = true\n[*]\nindent_size = 8\nquote_type = single\n"},
+        ]);
+        let source = "function f(){return \"x\"}";
+        let settings = serde_json::json!({"editorconfig": files}).to_string();
+        assert_eq!(
+            formatted("/p/api/a.ts", source, &settings),
+            "function f() {\n\treturn 'x';\n}\n"
+        );
+        let settings = serde_json::json!({
+            "editorconfig": files,
+            "config": {"name": ".prettierrc", "folder": "/p", "text": "useTabs: false"},
+        })
+        .to_string();
+        assert_eq!(
+            formatted("/p/api/a.ts", source, &settings),
+            "function f() {\n        return 'x';\n}\n"
+        );
+    }
+    #[test]
+    fn editorconfig_stops_at_the_root_file_and_honours_unset() {
+        let settings = serde_json::json!({"editorconfig": [
+            {"name": ".editorconfig", "folder": "/p/api", "text": "root = true\n[*]\nindent_size = 4\n"},
+            {"name": ".editorconfig", "folder": "/p", "text": "[*]\nquote_type = single\n"},
+        ]})
+        .to_string();
+        assert_eq!(
+            formatted("/p/api/a.ts", "function f(){return \"x\"}", &settings),
+            "function f() {\n    return \"x\";\n}\n"
+        );
+        let settings = serde_json::json!({"editorconfig": [
+            {"name": ".editorconfig", "folder": "/p/api", "text": "[*]\nindent_size = unset\n"},
+            {"name": ".editorconfig", "folder": "/p", "text": "[*]\nindent_size = 4\n"},
+        ]})
+        .to_string();
+        assert_eq!(
+            formatted("/p/api/a.ts", "function f(){return 1}", &settings),
+            "function f() {\n  return 1;\n}\n"
+        );
+    }
+    #[test]
+    fn settings_that_cannot_be_used_stop_the_format_with_a_note() {
+        for (name, text, expected) in [
+            (".prettierrc.json", r#"{"plugins":["x"]}"#, "plugins"),
+            (".prettierrc", "plugins: x", "plugins"),
+            (".prettierrc.json", r#""@acme/prettier""#, "shared config"),
+            (".prettierrc", "a: [", "could not be read"),
+            (".prettierrc.json", "[1]", "not a settings object"),
+            (".prettierrc.json", r#"{"tabWidth":"wide"}"#, "rejects"),
+            (".prettierrc.json", r#"{"parser":"yaml"}"#, "rejects"),
+        ] {
+            let note = note("/p/a.ts", "const a=1", &one_config(name, text));
+            assert!(note.contains(expected), "{text}: {note}");
+            assert!(note.starts_with("Not formatted:"), "{note}");
+        }
+    }
+    #[test]
+    fn empty_plugins_unknown_settings_and_empty_files_still_format() {
+        for (name, text) in [
+            (".prettierrc.json", r#"{"plugins":[],"madeUp":1}"#),
+            (".prettierrc", ""),
+            (".prettierrc", "# only a comment\n"),
+        ] {
+            assert_eq!(
+                formatted("/p/a.ts", "const a=1", &one_config(name, text)),
+                "const a = 1;\n",
+                "{text}"
+            );
+        }
+    }
+    #[test]
+    fn a_syntax_error_in_the_file_is_not_a_settings_problem() {
+        let result = format_with_settings(
+            "/p/a.ts",
+            "const =",
+            0,
+            &one_config(".prettierrc", "semi: false"),
+        )
+        .unwrap();
+        assert!(result.result.is_none());
+        assert!(result.note.is_none());
+    }
     #[test]
     fn prettier_and_emmet_keep_cursor_bytes_and_the_frontend_defaults() {
         let source = "const emoji='🙂';const value={x:1}";
-        let result = format("a.ts", source, source.find("value").unwrap())
+        let result = format("a.ts", source, source.find("value").unwrap(), "")
             .unwrap()
+            .result
             .unwrap();
         assert_eq!(
             result.formatted,
@@ -496,10 +722,18 @@ mod parity_tests {
             ("a.html", "<div><p>hello</p></div>"),
             ("a.md", "# heading\n\nhello   world"),
         ] {
-            assert!(format(path, source, 0).unwrap().is_some(), "{path}");
+            assert!(
+                format(path, source, 0, "").unwrap().result.is_some(),
+                "{path}"
+            );
         }
-        assert!(format("a.json", "{bad", 0).unwrap().is_none());
-        assert!(format("a.rs", "fn main(){}", 0).unwrap().is_none());
+        assert!(format("a.json", "{bad", 0, "").unwrap().result.is_none());
+        assert!(
+            format("a.rs", "fn main(){}", 0, "")
+                .unwrap()
+                .result
+                .is_none()
+        );
         let result = emmet("a.tsx", ".container>span", 15).unwrap().unwrap();
         assert!(result.formatted.contains("className=\"container\""));
         assert!(result.formatted[result.cursor..].starts_with("</span>"));

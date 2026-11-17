@@ -230,6 +230,7 @@ impl TranscriptView {
         }
         self.prepared_parsers.extend(parsers);
         self.history_start = 0;
+        self.promote_thinking_notes(0);
         self.rebuild(0, cx);
     }
     /// Renumber every source-indexed piece of state; `None` drops it.

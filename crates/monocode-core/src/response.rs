@@ -169,6 +169,40 @@ pub fn handoff(rows: &[Row]) -> String {
     limit(&sections.join("\n\n"), 1800)
 }
 
+/// A fork's time for people to read, in the local time zone.
+pub fn fork_time(at: u64) -> Option<String> {
+    let at = chrono::DateTime::from_timestamp_millis(i64::try_from(at).ok()?)?;
+    Some(
+        at.with_timezone(&chrono::Local)
+            .format("%b %-d at %H:%M")
+            .to_string(),
+    )
+}
+/// A fork's first message: the agent already holds the copied history, so it
+/// only needs to know that this is now a separate chat. Slash commands stay
+/// untouched, because text in front of one would turn it into a plain message.
+pub fn wrap_fork_prompt(history: &[Row], prompt: &str) -> String {
+    if prompt.trim_start().starts_with('/') {
+        return prompt.into();
+    }
+    let origin = history
+        .iter()
+        .rev()
+        .filter(|row| row.role == "tool")
+        .filter_map(|row| serde_json::from_str::<crate::tool::ToolCall>(&row.text).ok())
+        .find_map(|call| call.fork_origin());
+    let source = match &origin {
+        Some((from, at)) => match fork_time(*at) {
+            Some(at) => format!("the chat \"{from}\" on {at}"),
+            None => format!("the chat \"{from}\""),
+        },
+        None => "another chat".into(),
+    };
+    format!(
+        "<fork_notice>\nThe user forked this conversation from {source}. Everything before this message is copied history. This is now a separate chat, and the original chat continues on its own. Changes to files on disk are shared between both chats. Do not mention this notice unless it matters.\n</fork_notice>\n\n{prompt}"
+    )
+}
+
 pub fn outgoing_handoff_prompt(user_request: &str) -> String {
     let request = user_request.trim();
     let request = if request.is_empty() {
@@ -241,6 +275,22 @@ pub fn strip_goal_sections(markdown: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fork_notice_names_the_source_and_leaves_slash_commands_alone() {
+        let mut call = crate::tool::ToolCall::new("chat-fork", crate::tool::FORK);
+        call.input = serde_json::json!({"from": "Plan", "at": 1_794_000_000_000u64}).to_string();
+        let rows = [Row {
+            role: "tool".into(),
+            text: serde_json::to_string(&call).unwrap(),
+            first: true,
+            sent_at: None,
+        }];
+        let wrapped = super::wrap_fork_prompt(&rows, "Carry on");
+        assert!(wrapped.contains("the chat \"Plan\" on "));
+        assert!(wrapped.ends_with("Carry on"));
+        assert_eq!(super::wrap_fork_prompt(&rows, "/review"), "/review");
+        assert!(super::wrap_fork_prompt(&[], "Carry on").contains("from another chat."));
+    }
     use super::*;
 
     #[test]

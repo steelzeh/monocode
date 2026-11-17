@@ -144,6 +144,8 @@ fn run_turn_using(
     let mut handoff_accepted = false;
     // SessionReview's recorded turn: its project and id, once the baseline is taken.
     let mut checkpoint: Option<(String, String)> = None;
+    // Edit tools already reported to the review; providers resend finished tools.
+    let mut reviewed_tools = std::collections::HashSet::new();
     let mut created_worktree = None;
     let mut context = locked(&store)
         .ok()
@@ -438,6 +440,9 @@ fn run_turn_using(
             && provider::native_prompt(kind, &prompt)
                 .trim_start()
                 .starts_with('/');
+        if provider_id.is_none() {
+            settings.fork_from = locked(&store)?.fork_source(summary.id, &summary.provider)?;
+        }
         let prompt = if raw_native_command {
             prompt
         } else if let Some(mono) = &settings.mono {
@@ -491,6 +496,8 @@ fn run_turn_using(
             format!("{intro}\n\n{brief}\n\n<local_time>{now}</local_time>\n{prompt}")
         } else if let Some(handoff) = &settings.handoff {
             monocode_core::response::wrap_handoff_prompt(&handoff.from, &handoff.brief, &prompt)
+        } else if settings.fork_from.is_some() {
+            monocode_core::response::wrap_fork_prompt(&transcript.rows[..turn_start], &prompt)
         } else if provider_id.is_none() && turn_start > 0 {
             let mut history = String::new();
             for row in transcript.rows[..turn_start]
@@ -552,7 +559,7 @@ fn run_turn_using(
         if !raw_native_command && settings.operator_enabled {
             let cli = std::env::current_exe().map_err(|e| e.to_string())?;
             prompt = format!(
-                "You have MonoCode app access for this project. Use the CLI: {} app ACTION --json JSON. Supported actions: models.list {{}}, sessions.list {{}}, sessions.read {{sessionId}}, sessions.start {{prompt,harness?,model?,title?,draft?,reveal?}}, sessions.send/draft {{sessionId,prompt}}, sessions.stop {{sessionId}}, folders.list {{}}, folders.move {{sessionId,folderId?,newFolderName?}}, notes.list {{}}, notes.read {{id}}, notes.write {{id?,title,body}}, worktrees.list {{}}. Scope is this thread's project. App credentials are in the environment; never print them. Respect the user’s request and selected access policy.\n\n{prompt}",
+                "You have MonoCode app access for this project. Use the CLI: {} app ACTION --json JSON. Supported actions: models.list {{}}, sessions.list {{}}, sessions.read {{sessionId}}, sessions.title/rename {{sessionId?,title?}}, sessions.start {{prompt,harness?,model?,title?,draft?,reveal?}}, sessions.send/draft {{sessionId,prompt}}, sessions.stop {{sessionId}}, folders.list {{}}, folders.move {{sessionId,folderId?,newFolderName?}}, notes.list {{}}, notes.read {{id}}, notes.write {{id?,title,body}}, worktrees.list {{}}. Scope is this thread's project. App credentials are in the environment; never print them. Respect the user’s request and selected access policy.\n\n{prompt}",
                 shlex_quote(&cli.to_string_lossy())
             );
         }
@@ -581,6 +588,10 @@ fn run_turn_using(
                 prompt = discovery.prepend(prompt);
             }
         }
+        let review_cwd = settings
+            .worktree_cwd
+            .clone()
+            .unwrap_or_else(|| summary.cwd.clone());
         let request = Request {
             kind,
             binary,
@@ -739,6 +750,16 @@ fn run_turn_using(
                             start = start.min(ix);
                             pending.changed(ix);
                             contributions::record(&store, summary.id, &summary.cwd, &tool);
+                            if tool.state == monocode_core::tool::ToolState::Completed
+                                && reviewed_tools.insert(tool.id.clone())
+                            {
+                                review_edits(
+                                    &summary,
+                                    &review_cwd,
+                                    checkpoint.as_ref(),
+                                    &edited_paths(std::slice::from_ref(&transcript.rows[ix])),
+                                );
+                            }
                         }
                         Event::SessionId(id) => {
                             if provider_id.as_ref() != Some(&id) {
@@ -758,6 +779,7 @@ fn run_turn_using(
                                     })
                                 {
                                     store.provider_id(summary.id, &id)?;
+                                    store.clear_fork_source(summary.id)?;
                                 }
                                 provider_id = Some(id.clone());
                                 changed_id = Some(id);
@@ -1092,6 +1114,26 @@ fn run_turn_using(
 }
 
 /// checkpointEdits.ts's sessionEditPaths: files named by successful edit tools.
+/// Show an agent's edit in Agent Changes while its turn still runs.
+fn review_edits(
+    summary: &Session,
+    workdir: &str,
+    checkpoint: Option<&(String, String)>,
+    paths: &[String],
+) {
+    let Some(store) = monocode_core::checkpoint::store().filter(|_| !paths.is_empty()) else {
+        return;
+    };
+    let session = summary.id.to_string();
+    let _ = store.exclusive(|store| {
+        let own = store.project_record_edits(&summary.cwd, workdir, paths)?;
+        if let Some((cwd, _)) = checkpoint {
+            store.capture(&session, cwd, &own)?;
+        }
+        Ok(())
+    });
+}
+
 pub(crate) fn edited_paths(rows: &[Row]) -> Vec<String> {
     let mut paths = Vec::new();
     for row in rows.iter().filter(|r| r.role == "tool") {
@@ -1134,7 +1176,7 @@ pub(crate) fn edited_paths(rows: &[Row]) -> Vec<String> {
     paths
 }
 
-fn shlex_quote(text: &str) -> String {
+pub(crate) fn shlex_quote(text: &str) -> String {
     format!(
         "\"{}\"",
         text.replace('\\', "\\\\")

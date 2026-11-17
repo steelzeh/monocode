@@ -15,6 +15,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::scm::{expand_home, path_to_js, MAX_TEXT_FILE_BYTES};
 
+mod project;
+pub use project::ProjectFile;
+
 #[cfg(test)]
 mod tests;
 
@@ -239,6 +242,10 @@ impl Store {
                 .as_ref()
                 .map(|turn| turn.edited.clone())
                 .unwrap_or_else(|| carried.edited.clone()),
+            kept: pending
+                .as_ref()
+                .map(|turn| turn.kept.clone())
+                .unwrap_or_default(),
         };
         // Publish the pending state first. A failed baseline must not leave the
         // previous turn's card underneath the new response.
@@ -772,6 +779,10 @@ struct RecordedTurn {
     /// Older shared snapshots have no attribution evidence and stay out of the card.
     #[serde(default)]
     edited: BTreeSet<String>,
+    /// Blob ids of baselines that include the changes kept one at a time.
+    /// A file's review compares against this instead of the turn's baseline.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    kept: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -1122,6 +1133,26 @@ fn changes(root: &Path, turn: &RecordedTurn) -> Result<Vec<Change>, String> {
         });
     }
     out.sort_by(|a, b| a.relative.cmp(&b.relative));
+    // Changes kept one at a time moved the file's baseline forward.
+    for change in &mut out {
+        let Some(oid) = turn.kept.get(&change.relative) else {
+            continue;
+        };
+        let mode = change
+            .before
+            .as_ref()
+            .or(change.after.as_ref())
+            .map_or_else(|| "100644".to_string(), |blob| blob.mode.clone());
+        change.before = Some(Blob {
+            mode,
+            oid: oid.clone(),
+        });
+        let before = state_text(read_blob(root, change.before.as_ref())?);
+        let after = state_text(read_blob(root, change.after.as_ref())?);
+        let counts = crate::diff::build_unified_file(&before, &after, 0);
+        change.additions = counts.additions.into();
+        change.deletions = counts.deletions.into();
+    }
     Ok(out)
 }
 

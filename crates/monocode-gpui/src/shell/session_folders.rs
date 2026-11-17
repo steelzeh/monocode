@@ -209,6 +209,13 @@ impl Shell {
                 cx.notify();
             },
         ));
+        self.observations.push(cx.subscribe(
+            view,
+            |this, _, event: &crate::conversation::ChooseProject, cx| {
+                this.pending_project_picker = Some(event.0.clone());
+                cx.notify();
+            },
+        ));
     }
     fn open_folder_picker(
         &mut self,
@@ -275,6 +282,14 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
+        if let Some(anchor) = self.pending_project_picker.take() {
+            self.open_menu(
+                MenuTarget::CompactProjectPicker,
+                Anchor::Slot(anchor),
+                window,
+                cx,
+            );
+        }
         if let Some((id, anchor)) = self.pending_folder.take()
             && self.workspace.active == Some(id)
             && self.sessions.contains_key(&id)

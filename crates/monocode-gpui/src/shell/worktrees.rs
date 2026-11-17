@@ -24,6 +24,10 @@ impl Shell {
             .unwrap_or(&session.summary.cwd)
     }
     pub(super) fn in_worktree_scope(&self, id: i64, cx: &App) -> bool {
+        // A moved chat keeps its own folder, so it matches no checkout here.
+        if self.session_is_moved(id) {
+            return true;
+        }
         let scope = self
             .workspace
             .tab_of(id)
@@ -32,8 +36,12 @@ impl Shell {
         path_key(scope) == path_key(self.working_copy())
     }
     pub(super) fn in_sidebar_worktree_scope(&self, id: i64, cx: &App) -> bool {
+        if self.session_is_moved(id) {
+            return true;
+        }
+        // Each project's own selection: the project list shows several at once.
         self.worktree_focus
-            .get(&self.workspace.project)
+            .get(&self.session_metadata(id, cx).summary.cwd)
             .is_none_or(|focus| {
                 path_key(self.session_working_copy(id, cx)) == path_key(&focus.path)
             })

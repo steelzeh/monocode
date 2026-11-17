@@ -36,6 +36,7 @@ impl Conversation {
     ) -> Message {
         static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let prepared = self.completion.read(cx).prepare_prompt(&text);
+        let prepared = self.with_linked_chats(&text, prepared);
         Message {
             prepared_prompt: (prepared != text).then_some(prepared),
             id: format!(

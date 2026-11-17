@@ -5,6 +5,10 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
         "models.list"|"soul.read"|"habits.list"=>"",
         "sessions.list"|"folders.list"|"worktrees.list"=>"project",
         "sessions.read"=>"sessionId project before limit maxChars",
+        "sessions.title"=>"sessionId project",
+        "sessions.rename"=>"sessionId title project",
+        "sessions.setWorking"=>"sessionId working","worktrees.select"=>"path",
+        "composer.insert"=>"text","models.ask"=>"prompt",
         "sessions.start"=>"prompt project harness model modelSettings effort runtimeMode title draft reveal workspaceMode worktreeBase worktreeCwd placement besideSessionId notifyOnComplete",
         "sessions.send"=>"sessionId prompt project notifyOnComplete",
         "sessions.draft"=>"sessionId prompt project",
@@ -23,7 +27,15 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
         if !fields.split_whitespace().any(|f| f == key) {
             return Err(format!("{action} does not take {key}"));
         }
-        if ["draft", "reveal", "notifyOnComplete", "existing", "enabled"].contains(&key.as_str())
+        if [
+            "draft",
+            "reveal",
+            "notifyOnComplete",
+            "existing",
+            "enabled",
+            "working",
+        ]
+        .contains(&key.as_str())
             && !value.is_boolean()
         {
             return Err(format!("{key} must be true or false"));

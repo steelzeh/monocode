@@ -9,8 +9,45 @@ use crate::{
 use serde_json::{json, Value};
 use std::collections::HashMap;
 
+mod tweak_permissions;
+pub use tweak_permissions::{tweak_permission, TweakPermission, SEND_PROMPTS, TWEAK_PERMISSIONS};
+
 #[cfg(test)]
 mod tests;
+
+/// Checks a tweak's call. The tweak system has already checked its permission.
+pub fn validate_tweak_call(action: &str, input: &Value) -> Result<(), String> {
+    crate::mono::api::validate(action, input)
+}
+
+/// Asks the user's background model. Never joins or changes any chat.
+pub fn ask_text_model(
+    text: crate::session_title::TextModel,
+    cwd: &std::path::Path,
+    prompt: &str,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<String, String> {
+    if !crate::session_title::supports(text.kind) {
+        return Err("Choose a background model in Settings first".into());
+    }
+    let binary = crate::provider::resolve(text.kind)
+        .ok_or("The background model's command line tool was not found")?;
+    crate::provider::run_text(
+        crate::provider::Request {
+            kind: text.kind,
+            binary,
+            cwd: cwd.into(),
+            prompt: prompt.to_owned(),
+            provider_id: None,
+            model: text.model,
+            settings: crate::agent::Settings {
+                account: text.account,
+                ..Default::default()
+            },
+        },
+        cancel,
+    )
+}
 
 pub fn validate_operator(action: &str, input: &Value) -> Result<(), String> {
     if !matches!(
@@ -18,6 +55,8 @@ pub fn validate_operator(action: &str, input: &Value) -> Result<(), String> {
         "models.list"
             | "sessions.list"
             | "sessions.read"
+            | "sessions.title"
+            | "sessions.rename"
             | "sessions.start"
             | "sessions.send"
             | "sessions.draft"
@@ -39,6 +78,12 @@ pub fn validate_operator(action: &str, input: &Value) -> Result<(), String> {
         return Err("Completion notifications are only available in a Mono's chat".into());
     }
     Ok(())
+}
+
+/// Actions on a session's title. Every chat may use them on itself; an
+/// Operator thread may also name other sessions in its project.
+pub fn is_title_action(action: &str) -> bool {
+    matches!(action, "sessions.title" | "sessions.rename")
 }
 
 pub fn text(input: &Value, key: &str, max: usize) -> Result<String, String> {

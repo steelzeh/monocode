@@ -23,6 +23,8 @@ mod tests;
 
 /// The transcript must remeasure this row when its content changes.
 pub(crate) struct VisualChanged;
+/// What a tweak's panel asked for after a click.
+pub(crate) struct TweakActions(pub Vec<monocode_core::tweaks::AppCall>);
 pub(crate) struct VisualView {
     document: VisualDocument,
     runtime: Option<VisualRuntime>,
@@ -41,8 +43,11 @@ pub(crate) struct VisualView {
     inline: Option<String>,
     /// When the visual first appeared, for its charts' entrances.
     motion: dither::Motion,
+    /// A tweak's panel carries its context as JSON; a chat's visual has none.
+    host: Option<String>,
 }
 impl EventEmitter<VisualChanged> for VisualView {}
+impl EventEmitter<TweakActions> for VisualView {}
 struct SliderDrag {
     key: String,
     handler: String,
@@ -63,7 +68,7 @@ struct SceneCache {
     projection: Rc<scene::Projection>,
 }
 
-fn color(token: &ThemeColor) -> Hsla {
+pub(crate) fn color(token: &ThemeColor) -> Hsla {
     // Semantic hues need darker variants when the interface uses dark ink.
     let light_surface = content(1.).l < 0.5;
     let hue = |dark, light| gpui::rgb(if light_surface { light } else { dark }).into();
@@ -163,6 +168,127 @@ fn activated(event: &gpui::KeyDownEvent) -> bool {
 
 impl VisualView {
     pub(crate) fn new(document: VisualDocument, _cx: &mut Context<Self>) -> Self {
+        Self::build(document, None)
+    }
+    /// A tweak's panel: the same sandbox and drawing, without the title row.
+    pub(crate) fn tweak(
+        document: VisualDocument,
+        context: String,
+        _cx: &mut Context<Self>,
+    ) -> Self {
+        Self::build(document, Some(context))
+    }
+    /// The program failed or never started, so it needs a new start.
+    pub(crate) fn is_stopped(&self) -> bool {
+        self.runtime.as_ref().is_none_or(VisualRuntime::is_stopped)
+    }
+    fn take_tweak_calls(&mut self) -> Vec<monocode_core::tweaks::AppCall> {
+        match self.runtime.as_mut().map(VisualRuntime::take_calls) {
+            Some(Ok(calls)) => calls,
+            Some(Err(error)) => {
+                self.error = Some(error);
+                Vec::new()
+            }
+            None => Vec::new(),
+        }
+    }
+    fn show_tweak_result(
+        &mut self,
+        tree: Result<Node, String>,
+        cx: &mut Context<Self>,
+    ) -> Vec<monocode_core::tweaks::AppCall> {
+        let calls = match tree {
+            Ok(tree) => {
+                self.revision = self.revision.wrapping_add(1);
+                self.tree = Some(tree);
+                self.error = None;
+                self.take_tweak_calls()
+            }
+            Err(error) => {
+                self.error = Some(error);
+                Vec::new()
+            }
+        };
+        self.changed(cx);
+        calls
+    }
+    /// Lets the panel load its data, and returns the calls it made for that.
+    pub(crate) fn tweak_refresh(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Vec<monocode_core::tweaks::AppCall> {
+        let Some(runtime) = self.runtime.as_mut() else {
+            return Vec::new();
+        };
+        let tree = runtime.refresh_panel();
+        self.show_tweak_result(tree, cx)
+    }
+    /// Gives the panel an answer, and returns the calls it made in response.
+    pub(crate) fn tweak_deliver(
+        &mut self,
+        request: u64,
+        answer: &str,
+        cx: &mut Context<Self>,
+    ) -> Vec<monocode_core::tweaks::AppCall> {
+        let Some(runtime) = self.runtime.as_mut() else {
+            return Vec::new();
+        };
+        let tree = runtime.deliver_to_panel(request, answer);
+        self.show_tweak_result(tree, cx)
+    }
+    /// Ends a panel the app refused to keep running, and says why.
+    pub(crate) fn stop_tweak(&mut self, error: String, cx: &mut Context<Self>) {
+        if let Some(runtime) = self.runtime.as_mut() {
+            runtime.stop();
+        }
+        self.error = Some(error);
+        self.changed(cx);
+    }
+    /// Keeps the panel's own state and redraws it with fresh data.
+    pub(crate) fn set_tweak_context(&mut self, context: &str, cx: &mut Context<Self>) {
+        if self.host.as_deref() == Some(context) {
+            return;
+        }
+        self.host = Some(context.to_owned());
+        let Some(runtime) = self.runtime.as_mut() else {
+            self.initialize();
+            self.changed(cx);
+            return;
+        };
+        match runtime.set_context(context) {
+            Ok(tree) => {
+                self.revision = self.revision.wrapping_add(1);
+                self.tree = Some(tree);
+                self.error = None;
+            }
+            Err(error) => self.error = Some(error),
+        }
+        self.changed(cx);
+    }
+    #[cfg(test)]
+    pub(crate) fn error_for_test(&self) -> Option<String> {
+        self.error.clone()
+    }
+    #[cfg(test)]
+    pub(crate) fn click_first_button_for_test(&mut self, cx: &mut Context<Self>) {
+        fn find(node: &Node) -> Option<String> {
+            match node {
+                Node::Button { handler, .. } => Some(handler.clone()),
+                Node::Column { children, .. }
+                | Node::Row { children, .. }
+                | Node::Grid { children, .. }
+                | Node::Card { children, .. } => children.iter().find_map(find),
+                _ => None,
+            }
+        }
+        let handler = self
+            .tree
+            .as_ref()
+            .and_then(find)
+            .unwrap_or_else(|| panic!("no button to click: {:?}", self.error));
+        self.dispatch(&handler, Value::Null, cx);
+    }
+    fn build(document: VisualDocument, host: Option<String>) -> Self {
         let mut this = Self {
             document,
             runtime: None,
@@ -179,6 +305,7 @@ impl VisualView {
             scene_cache: HashMap::new(),
             inline: None,
             motion: dither::Motion(std::time::Instant::now()),
+            host,
         };
         this.initialize();
         this
@@ -198,7 +325,10 @@ impl VisualView {
         match self
             .document
             .validate()
-            .and_then(|()| VisualRuntime::new(&self.document.source))
+            .and_then(|()| match &self.host {
+                Some(context) => VisualRuntime::with_host(&self.document.source, context),
+                None => VisualRuntime::new(&self.document.source),
+            })
             .and_then(|mut runtime| {
                 let tree = runtime.render()?;
                 Ok((runtime, tree))
@@ -252,6 +382,12 @@ impl VisualView {
                 self.error = Some(error);
                 self.slider_drag = None;
                 self.scene_drag = None;
+            }
+        }
+        if self.host.is_some() {
+            let calls = self.take_tweak_calls();
+            if !calls.is_empty() {
+                cx.emit(TweakActions(calls));
             }
         }
         self.changed(cx);
@@ -1066,7 +1202,8 @@ impl Render for VisualView {
         self.scene_cache.retain(|key, _| self.active.contains(key));
         let inline = self.inline.clone();
         // A visual in its own row is titled; placed in prose, it is captioned.
-        let header = inline.is_none().then(|| {
+        let hosted = self.host.is_some();
+        let header = (inline.is_none() && !hosted).then(|| {
             div()
                 .min_w_0()
                 .font_weight(FontWeight::SEMIBOLD)
@@ -1247,9 +1384,12 @@ fn paint_label(
     let line = window
         .text_system()
         .shape_line(text.into(), px(font_size), &[run], None);
+    // A label's y is its baseline, as in SVG text and canvas fillText. A line
+    // box of ascent + descent has no padding, so its top is one ascent above
+    // the baseline.
     let _ = line.paint(
-        at,
-        px(font_size * 1.4),
+        at - point(px(0.), line.ascent),
+        line.ascent + line.descent,
         gpui::TextAlign::Left,
         None,
         window,

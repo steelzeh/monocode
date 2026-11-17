@@ -30,6 +30,21 @@ enum Row {
     },
     ClassicFolderNew(String),
     ClassicGap(usize),
+    ProjectsHeading,
+    ProjectFolder {
+        path: String,
+        sessions: Vec<i64>,
+    },
+    PeekedSession {
+        id: i64,
+        first: bool,
+        last: bool,
+    },
+    ProjectFolderAll {
+        path: String,
+        total: usize,
+    },
+    FocusedProject,
     Empty,
 }
 
@@ -39,6 +54,8 @@ pub(super) struct SidebarList {
     scope: String,
     structure_dirty: Cell<bool>,
     indexed_minute: u64,
+    /// The project list shows open chats under their folded projects.
+    indexed_open: Vec<i64>,
     #[cfg(test)]
     structural_rebuilds: usize,
     /// Only anchors constructed for the last viewport, including nested rails.
@@ -66,6 +83,7 @@ impl SidebarList {
             scope: String::new(),
             structure_dirty: Cell::new(true),
             indexed_minute: 0,
+            indexed_open: Vec::new(),
             #[cfg(test)]
             structural_rebuilds: 0,
             visible_anchors: RefCell::new(Vec::new()),
@@ -228,12 +246,16 @@ impl Shell {
     /// hover state. Keep the expensive project index until a data notification
     /// invalidates it; individual cards still read live metadata each render.
     pub(super) fn refresh_sidebar_structure(&mut self, cx: &mut Context<Self>) {
+        self.end_stale_project_focus();
         let scope = self.sidebar_scope();
         let minute = monocode_core::time::now_ms() / 60_000;
         if self.sidebar_list.structure_dirty.replace(false)
             || self.sidebar_list.scope != scope
             || self.sidebar_list.indexed_minute != minute
+            || (self.project_list_showing()
+                && self.sidebar_list.indexed_open != self.workspace.open_sessions())
         {
+            self.sidebar_list.indexed_open = self.workspace.open_sessions();
             // Date/time expiry refreshes membership without resetting the
             // project scope or scroll anchor.
             self.sidebar_list.indexed_minute = minute;
@@ -267,10 +289,13 @@ impl Shell {
     }
 
     fn sidebar_scope(&self) -> String {
+        // The project list stays put, and keeps its scroll, across a switch.
+        let folders = self.project_list_showing();
         format!(
-            "{}\0{}\0{}\0{:?}\0{}\0{}\0{}",
-            self.workspace.project,
-            self.working_copy(),
+            "{}\0{}\0{}\0{}\0{:?}\0{}\0{}\0{}",
+            folders,
+            if folders { "" } else { &self.workspace.project },
+            if folders { "" } else { self.working_copy() },
             self.query,
             self.workspace.session_filters,
             self.workspace.preferences.show_archived,
@@ -284,9 +309,16 @@ impl Shell {
             self.prepare_classic_sidebar_list(entries);
             return;
         }
+        if self.project_list_showing() {
+            self.prepare_project_folder_list(cx);
+            return;
+        }
         let groups = self.project_groups();
         let now = monocode_core::time::now_ms();
         let mut rows = vec![Row::Navigation, Row::Monos];
+        if self.project_folders_active() {
+            rows.push(Row::FocusedProject);
+        }
         let mut folders = false;
         for entry in entries {
             let (members, collapsed) = match entry {
@@ -371,6 +403,50 @@ impl Shell {
         self.sidebar_list.update(self.sidebar_scope(), rows);
     }
 
+    fn prepare_project_folder_list(&mut self, cx: &App) {
+        let mut rows = vec![Row::Navigation, Row::Monos, Row::ProjectsHeading];
+        self.project_flyout.minus_rows.clear();
+        let searching = !self.query.is_empty();
+        let mut empty = true;
+        for (path, ids) in self.project_folder_sessions(cx) {
+            let sessions: Vec<_> = ids
+                .into_iter()
+                .filter(|id| !self.rails.children.contains(id))
+                .collect();
+            if searching && sessions.is_empty() {
+                continue;
+            }
+            empty = false;
+            let members = self.project_folder_members(&path, &sessions, cx);
+            let more = (self.project_folder_expanded(&path) && members.len() < sessions.len())
+                .then(|| Row::ProjectFolderAll {
+                    path: path.clone(),
+                    total: sessions.len(),
+                });
+            self.project_flyout.track_row(&path);
+            rows.push(Row::ProjectFolder { path, sessions });
+            self.project_flyout.minus_rows.extend(
+                members
+                    .iter()
+                    .filter(|(_, peeked)| *peeked)
+                    .map(|(id, _)| *id),
+            );
+            rows.extend(members.iter().enumerate().map(|(ix, (id, peeked))| {
+                let (id, first, last) = (*id, ix == 0, ix + 1 == members.len());
+                if *peeked {
+                    Row::PeekedSession { id, first, last }
+                } else {
+                    Row::GroupedSession { id, first, last }
+                }
+            }));
+            rows.extend(more);
+        }
+        if empty {
+            rows.push(Row::Empty);
+        }
+        self.sidebar_list.update(self.sidebar_scope(), rows);
+    }
+
     fn prepare_classic_sidebar_list(&mut self, entries: &[Entry]) {
         let groups = self.project_groups();
         // Original Sidebar.tsx: the list has p-1.5, gap-0.5 and pb-10.
@@ -432,6 +508,7 @@ impl Shell {
             if let Some(
                 Row::Session(id)
                 | Row::GroupedSession { id, .. }
+                | Row::PeekedSession { id, .. }
                 | Row::ClassicGroupMember { id, .. },
             ) = self.sidebar_list.rows.get(ix)
                 && (self.rails.started.contains_key(id)
@@ -518,6 +595,17 @@ impl Shell {
                     )
                     .into_any();
             }
+            Row::PeekedSession { id, first, last } => {
+                return div()
+                    .px_2()
+                    .child(
+                        div()
+                            .ml(px(10.))
+                            .when(first, |d| d.pt_1())
+                            .child(rails::step(last, self.nested_session_card(id, cx))),
+                    )
+                    .into_any();
+            }
             Row::ClassicGroupMember {
                 entry,
                 id,
@@ -536,6 +624,10 @@ impl Shell {
                     .into_any();
             }
             Row::ClassicGap(height) => return div().h(px(height as f32)).into_any(),
+            Row::ProjectsHeading => self.project_folders_heading(cx),
+            Row::ProjectFolder { path, sessions } => self.project_folder_row(&path, &sessions, cx),
+            Row::ProjectFolderAll { path, total } => self.project_folder_all_row(&path, total, cx),
+            Row::FocusedProject => self.focused_project_row(cx),
             Row::Empty => div()
                 .px_2()
                 .py_2()
@@ -562,7 +654,7 @@ const TRAILING_SLOT: f32 = 14.;
 
 impl Shell {
     pub(super) fn sidebar_options_menu_items(&self) -> Vec<MenuItem> {
-        vec![
+        let mut items: Vec<MenuItem> = vec![
             MenuAction::new("sidebar-search", "Search")
                 .icon("search")
                 .toggle(self.workspace.sidebar_search_visible)
@@ -594,7 +686,16 @@ impl Shell {
                 .icon("list-bullet")
                 .toggle(self.workspace.compact_session_cards)
                 .into(),
-        ]
+        ];
+        if !self.workspace.classic_layout {
+            items.push(
+                MenuAction::new("sidebar-project-folders", "Project folders")
+                    .icon("folder-tree")
+                    .toggle(self.workspace.sidebar_project_folders)
+                    .into(),
+            );
+        }
+        items
     }
 
     pub(super) fn change_sidebar_option(&mut self, action: &str, cx: &mut Context<Self>) {
@@ -606,9 +707,13 @@ impl Shell {
             "sidebar-monos" => &mut self.workspace.preferences.monos,
             "sidebar-activity" => &mut self.workspace.sidebar_activity_visible,
             "compact-session-cards" => &mut self.workspace.compact_session_cards,
+            "sidebar-project-folders" => &mut self.workspace.sidebar_project_folders,
             _ => return,
         };
         *value = !*value;
+        if action == "sidebar-project-folders" {
+            self.workspace.sidebar_focused_project = None;
+        }
         if action == "sidebar-monos" {
             self.apply_preferences(cx);
             self.sync_settings(cx);
@@ -616,7 +721,97 @@ impl Shell {
         self.close_preview(cx);
         self.sidebar_list.remeasure();
         self.persist(cx);
+        if action == "sidebar-project-folders" {
+            self.invalidate_chrome(cx);
+        }
         cx.notify();
+    }
+
+    /// The full-width Search field: atop the Original layout's navigation,
+    /// and, `inset`, in the header of the project list: darker than the
+    /// sidebar, as if set into it, with no raised shadow.
+    pub(super) fn sidebar_search_field(
+        &self,
+        inset: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let field = div()
+            .id("rail-search")
+            .debug_selector(|| "sidebar-search-field".into())
+            .group("rail-search")
+            .w_full()
+            .px_1p5()
+            .rounded_md()
+            .border_1();
+        let field = if inset {
+            field
+                .px_2()
+                .bg(gpui::black().opacity(0.24))
+                .border_color(content(0.04))
+                .hover(|s| s.bg(gpui::black().opacity(0.32)).text_color(content(1.)))
+        } else {
+            field
+                .border_color(content(0.08))
+                // RailSearch's Tailwind shadow-sm, including
+                // its tighter second layer below the border.
+                // The vendored shader keeps it outside the
+                // box, as CSS does.
+                .shadow(vec![
+                    BoxShadow::new(px(0.), px(1.), rgba(0x0000001a).into()).blur_radius(px(3.)),
+                    BoxShadow::new(px(0.), px(1.), rgba(0x0000001a).into())
+                        .blur_radius(px(2.))
+                        .spread_radius(px(-1.)),
+                ])
+                .hover(|s| s.bg(content(0.1)).text_color(content(1.)))
+        };
+        field
+            .text_color(content(if self.sidebar_hover == Some("Search") {
+                1.
+            } else {
+                0.5
+            }))
+            .font_weight(FontWeight::MEDIUM)
+            .on_hover(cx.listener(|this, hovered, _, cx| {
+                this.sidebar_hover = if *hovered { Some("Search") } else { None };
+                this.notify_navigation(cx);
+            }))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| {
+                    this.focus_search(window, cx);
+                }),
+            )
+            .flex()
+            .items_center()
+            .gap_2()
+            .text_size(px(14.))
+            .child(
+                icon("search", 16.)
+                    .text_color(content(0.35))
+                    .group_hover("rail-search", |s| s.text_color(content(0.7))),
+            )
+            .child(
+                // A line box of the text's own height keeps it centred.
+                div()
+                    .debug_selector(|| "sidebar-search-label".into())
+                    .flex_1()
+                    .min_w_0()
+                    .when(inset, |d| d.text_size(px(13.)).line_height(px(16.)))
+                    .when(!inset, |d| d.h(px(20.)))
+                    .child("Search"),
+            )
+            .child(
+                // The shortcut span sits outside the label's `font-medium`.
+                div()
+                    .text_size(px(11.))
+                    .font_weight(FontWeight::NORMAL)
+                    .text_color(content(0.4))
+                    .child(if cfg!(target_os = "macos") {
+                        "⌘K"
+                    } else {
+                        "Ctrl K"
+                    }),
+            )
     }
 
     pub(super) fn sidebar_navigation(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -641,73 +836,13 @@ impl Shell {
             .flex_col()
             .gap_px()
             .when(search_field, |d| {
-                d.child(
-                    div()
-                        .id("rail-search")
-                        .debug_selector(|| "sidebar-search-field".into())
-                        .group("rail-search")
-                        .w_full()
-                        .h(px(32.))
-                        .mb(px(if self.workspace.classic_layout {
-                            2.
-                        } else {
-                            4.
-                        }))
-                        .px_1p5()
-                        .rounded_md()
-                        .border_1()
-                        .border_color(content(0.08))
-                        // RailSearch's Tailwind shadow-sm, including
-                        // its tighter second layer below the border.
-                        // The vendored shader keeps it outside the
-                        // box, as CSS does.
-                        .shadow(vec![
-                            BoxShadow::new(px(0.), px(1.), rgba(0x0000001a).into())
-                                .blur_radius(px(3.)),
-                            BoxShadow::new(px(0.), px(1.), rgba(0x0000001a).into())
-                                .blur_radius(px(2.))
-                                .spread_radius(px(-1.)),
-                        ])
-                        .text_color(content(if self.sidebar_hover == Some("Search") {
-                            1.
-                        } else {
-                            0.5
-                        }))
-                        .font_weight(FontWeight::MEDIUM)
-                        .hover(|s| s.bg(content(0.1)).text_color(content(1.)))
-                        .on_hover(cx.listener(|this, hovered, _, cx| {
-                            this.sidebar_hover = if *hovered { Some("Search") } else { None };
-                            this.notify_navigation(cx);
-                        }))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _, window, cx| {
-                                this.focus_search(window, cx);
-                            }),
-                        )
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .text_size(px(14.))
-                        .child(
-                            icon("search", 16.)
-                                .text_color(content(0.35))
-                                .group_hover("rail-search", |s| s.text_color(content(0.7))),
-                        )
-                        .child(div().flex_1().min_w_0().h(px(20.)).child("Search"))
-                        .child(
-                            // The shortcut span sits outside the label's `font-medium`.
-                            div()
-                                .text_size(px(11.))
-                                .font_weight(FontWeight::NORMAL)
-                                .text_color(content(0.4))
-                                .child(if cfg!(target_os = "macos") {
-                                    "⌘K"
-                                } else {
-                                    "Ctrl K"
-                                }),
-                        ),
-                )
+                d.child(self.sidebar_search_field(false, cx).h(px(32.)).mb(px(
+                    if self.workspace.classic_layout {
+                        2.
+                    } else {
+                        4.
+                    },
+                )))
             })
             .children(
                 [
@@ -831,7 +966,7 @@ impl Shell {
             .into_any()
     }
     /// The workspace shows an open session that has no messages yet.
-    fn active_session_is_blank(&self, cx: &App) -> bool {
+    pub(super) fn active_session_is_blank(&self, cx: &App) -> bool {
         !self.app_view_open()
             && self.app_search.is_none()
             && !self.mono_active(cx)

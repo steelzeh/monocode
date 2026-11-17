@@ -13,7 +13,9 @@ mod session_metadata;
 pub use session_metadata::{MobileSessionMetadata, SessionSidebarMetadata};
 mod session_preview;
 pub use session_preview::SessionPreviewData;
+mod chat_links;
 mod edit;
+mod fork;
 mod shared;
 mod side_threads;
 mod thread_files;
@@ -1031,6 +1033,8 @@ impl Store {
         let dir = self.thread_dir(id).ok().flatten();
         self.delete_rows(id)?;
         thread_files::remove_dir(dir);
+        // A later chat can get this id again. It must not inherit the links.
+        let _ = self.forget_chat_links(id);
         Ok(())
     }
     fn delete_rows(&mut self, id: i64) -> Result<(), String> {

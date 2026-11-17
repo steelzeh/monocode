@@ -142,6 +142,12 @@ pub fn stage_chunk(original: &str, current: &str, chunk: usize) -> Option<String
     ))
 }
 
+/// `current` with only that chunk put back as it was in `original`: undoing
+/// one change. Chunks are numbered as `stage_chunk` numbers them.
+pub fn revert_chunk(original: &str, current: &str, chunk: usize) -> Option<String> {
+    stage_chunk(current, original, chunk)
+}
+
 /// diffComment.ts's `diffCommentLocation`: `path:line`.
 pub fn comment_location(path: &str, line: &Line) -> String {
     let number = if line.kind == LineKind::Del {
@@ -667,5 +673,45 @@ mod tests {
                 .count(),
             10
         );
+    }
+
+    #[test]
+    fn keeping_or_undoing_each_chunk_touches_only_that_chunk() {
+        let cases = [
+            ("a\nb\nc\nd\ne\nf\ng\n", "a\nB\nc\nd\ne\nF\nG\nh\n"),
+            (
+                "one\ntwo\nthree\nfour\nfive\nsix\n",
+                "zero\none\nthree\nfour\nfive\nsix\nseven",
+            ),
+            ("", "new file\nwith lines\n"),
+            ("gone\n", ""),
+        ];
+        for (original, current) in cases {
+            let chunks = (0..)
+                .take_while(|chunk| stage_chunk(original, current, *chunk).is_some())
+                .count();
+            assert!(chunks > 0);
+            let mut kept = original.to_string();
+            let mut undone = current.to_string();
+            for chunk in (0..chunks).rev() {
+                kept = stage_chunk(&kept, current, chunk).unwrap();
+                undone = revert_chunk(original, &undone, chunk).unwrap();
+            }
+            // Keeping every chunk reaches the result; undoing every one, the original.
+            assert_eq!(kept, current);
+            assert_eq!(undone, original);
+            for chunk in 0..chunks {
+                // Keeping one chunk and undoing it change the same lines.
+                let part = stage_chunk(original, current, chunk).unwrap();
+                let back = revert_chunk(original, current, chunk).unwrap();
+                let kept = build_unified_file(original, &part, 0);
+                let undone = build_unified_file(&back, current, 0);
+                assert_eq!(
+                    (kept.additions, kept.deletions),
+                    (undone.additions, undone.deletions)
+                );
+                assert!(kept.additions + kept.deletions > 0);
+            }
+        }
     }
 }

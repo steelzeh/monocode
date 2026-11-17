@@ -103,6 +103,8 @@ pub(crate) struct Preferences {
     pub mono_menu_bar_icon: bool,
     // Archive
     pub show_archived: bool,
+    /// Rounded layout: Explorer, History and files left, the sidebar right.
+    pub swap_side_panels: bool,
     // Keybindings: a changed shortcut, or `None` for a disabled one.
     pub keybindings: HashMap<String, Option<String>>,
 }
@@ -185,6 +187,7 @@ impl Default for Preferences {
             rail_monos_pinned: false,
             mono_menu_bar_icon: true,
             show_archived: false,
+            swap_side_panels: false,
             keybindings: HashMap::new(),
         }
     }

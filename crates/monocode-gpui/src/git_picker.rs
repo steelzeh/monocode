@@ -320,12 +320,12 @@ impl gpui::Render for GitPicker {
                             })
                         };
                         (
-                            tree.branch.unwrap_or_else(|| {
+                            tree.in_repo(tree.branch.clone().unwrap_or_else(|| {
                                 format!(
                                     "Detached {}",
                                     tree.head.chars().take(7).collect::<String>()
                                 )
-                            }),
+                            })),
                             Some(if tree.main {
                                 "Project folder".into()
                             } else {

@@ -69,17 +69,23 @@ pub(crate) fn collect(rows: &[Row], from: usize, streaming: bool) -> Phases {
         } else if role == "tool"
             && let Ok(mut call) = serde_json::from_str::<ToolCall>(&rows[at].text)
         {
-            let standalone = match call.panel() {
-                Some(Panel::Agent(_))
-                    if live_turn.is_some_and(|turn| at >= turn)
-                        || matches!(call.state, ToolState::Failed | ToolState::Cancelled) =>
-                {
-                    result.pinned.insert(at);
-                    true
-                }
-                Some(Panel::Tasks(_)) => true,
-                _ => false,
-            };
+            // The box with the reply stays in the chat, outside the work fold.
+            let question = super::question_box::is_question(&call);
+            if question {
+                result.pinned.insert(at);
+            }
+            let standalone = question
+                || match call.panel() {
+                    Some(Panel::Agent(_))
+                        if live_turn.is_some_and(|turn| at >= turn)
+                            || matches!(call.state, ToolState::Failed | ToolState::Cancelled) =>
+                    {
+                        result.pinned.insert(at);
+                        true
+                    }
+                    Some(Panel::Tasks(_)) => true,
+                    _ => false,
+                };
             if standalone {
                 flush(at, &mut members, &mut calls, &mut result);
                 leading = false;

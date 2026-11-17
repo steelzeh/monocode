@@ -1,13 +1,16 @@
 mod accounts;
 mod actions;
+mod agent_review;
 mod app_commands;
 mod app_views;
 mod automation_runs;
+mod chat_mention_drop;
 mod classic_sidebar;
 #[cfg(test)]
 mod classic_surface_tests;
 mod classic_surfaces;
 mod file_panes;
+mod fork_chat;
 mod github_star;
 mod idle_agents;
 #[cfg(test)]
@@ -17,6 +20,7 @@ mod live_agents;
 mod mobile_host;
 mod mono_panes;
 pub(crate) mod monos;
+mod move_chat;
 mod new_chat_choice;
 #[cfg(test)]
 mod new_chat_choice_tests;
@@ -24,6 +28,7 @@ mod notifications;
 mod orchestration;
 mod picker_preferences;
 mod pinned_tabs;
+mod project_folders;
 mod project_rail;
 mod project_removal;
 mod project_settings;
@@ -39,6 +44,7 @@ mod session_groups;
 mod session_loading;
 mod session_preview;
 mod session_shortcuts;
+mod session_titles;
 mod settings;
 mod shortcuts;
 mod sidebar_list;
@@ -48,6 +54,7 @@ mod terminal_dock;
 mod terminal_panes;
 use terminal_panes::terminal_drag_ghost;
 mod title_tabs;
+mod tweak_panel;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 mod window_chrome;
 mod worktrees;
@@ -597,6 +604,8 @@ const MIN_CHAT_WIDTH: f32 = 420.;
 /// A sideways tab drag sags; only a deliberate pull below the strip
 /// targets a pane (TitleBar's PANE_DROP_PULL).
 const PANE_DROP_PULL: f32 = 32.;
+/// Room for the named Search tab in the swapped panel's tab row.
+const SEARCH_TAB_ROOM: f32 = 84.;
 
 struct SessionPreview {
     id: i64,
@@ -704,11 +713,15 @@ pub(crate) struct Shell {
     session_row_bounds: HashMap<i64, AnchorSlot>,
     folder_bounds: HashMap<String, AnchorSlot>,
     sidebar_drop: Option<session_groups::ListDrop>,
+    /// The chat whose message box is under a chat dragged from the sidebar.
+    chat_mention_drop: Option<i64>,
     folder_drag: Option<session_groups::FolderDrag>,
     skip_folder_click: bool,
     filter_anchor: AnchorSlot,
     folder_picker: Option<session_folders::Open>,
     pending_folder: Option<(i64, AnchorSlot)>,
+    /// An empty chat's project chip asked for the project picker.
+    pending_project_picker: Option<AnchorSlot>,
     _session_clock: gpui::Task<()>,
     notes: Option<Entity<Notes>>,
     /// The sidebar's Notes count; `None` until the store has answered.
@@ -744,6 +757,7 @@ pub(crate) struct Shell {
     session_preview: Option<SessionPreview>,
     preview_close: Option<gpui::Task<()>>,
     preview_open: Option<gpui::Task<()>>,
+    project_flyout: project_folders::ProjectFlyout,
     sidebar_last_scroll: Option<std::time::Instant>,
     window_observed: bool,
     shortcuts: Option<shortcuts::Shortcuts>,
@@ -768,7 +782,21 @@ pub(crate) struct Shell {
     pending_project_blanks: HashSet<String>,
     new_tab_task: Option<gpui::Task<()>>,
     worktree_focus: HashMap<String, crate::worktree_switcher::WorktreeFocus>,
+    /// What the Tweaks tab was last told: the project, and the versions of the
+    /// app state and the tweak list. A change means the panel should refresh.
+    tweak_panel_key: Option<(String, u64, u64)>,
+    /// Chats marked as working: by whom, and since when.
+    working_titles: HashMap<i64, (String, std::time::Instant)>,
+    /// How to cancel each app call a tweak has running.
+    tweak_cancels: HashMap<String, std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Model answers each tweak still waits for.
+    tweak_requests: HashMap<String, usize>,
+    _tweak_changes: Option<Subscription>,
     session_worktrees: HashMap<i64, Option<String>>,
+    /// Files with unread agent work, per project.
+    agent_changes: HashMap<String, Vec<monocode_core::checkpoint::ProjectFile>>,
+    agent_changes_task: Option<gpui::Task<()>>,
+    agent_changes_dirty: bool,
     session_details: HashMap<i64, monocode_core::store::MobileSessionMetadata>,
     sidebar_hidden_sessions: HashSet<i64>,
     worktree_returns: HashMap<(String, String), i64>,
@@ -789,6 +817,7 @@ pub(crate) struct Shell {
     tab_scroll_task: Option<gpui::Task<()>>,
     resize: Option<(Pixels, f32)>,
     pub(crate) git: Entity<crate::git_status::ProjectGit>,
+    pub(crate) workspace_folders: Entity<crate::workspace_folders::WorkspaceFolders>,
     pub(crate) right_panel: Option<Entity<RightPanel>>,
     right_resize: Option<(Pixels, f32)>,
     /// Either right-panel handle is hovered; both of its hairlines light up.
@@ -874,6 +903,7 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> Self {
         crate::accounts::install(store.clone(), cx);
+        crate::tweaks::install(store.clone(), cx);
         let remote_dir = locked(&store)
             .ok()
             .and_then(|store| store.data_dir().map(std::path::Path::to_path_buf))
@@ -962,6 +992,18 @@ impl Shell {
         });
         let git_project = workspace.project.clone();
         let git = cx.new(|cx| crate::git_status::ProjectGit::new(git_project, cx));
+        let workspace_folders = cx.new({
+            let git = git.clone();
+            move |cx| crate::workspace_folders::WorkspaceFolders::new(git, cx)
+        });
+        // A workspace's other repos change the title bar's count too.
+        let workspace_observation = cx.observe(&workspace_folders, |this, _, cx| {
+            this.sync_project_rail_git_stats(cx);
+            if this.workspace.classic_layout {
+                this.sidebar_frame.update(cx, |_, cx| cx.notify());
+            }
+            cx.notify();
+        });
         let git_observation = cx.observe(&git, |this, git, cx| {
             let cwd = git.read(cx).root.clone();
             for view in this.sessions.values() {
@@ -980,6 +1022,8 @@ impl Shell {
         // this checkout reread their recorded changes, which drops reverted
         // files from the changes pill and its card.
         let git_changes = cx.subscribe(&git, |this, git, _: &crate::git_status::GitChanged, cx| {
+            // Commits and edits outside the app resolve agent work too.
+            this.refresh_agent_changes(cx);
             let cwd = git.read(cx).root.clone();
             for view in this.sessions.values() {
                 if view.read(cx).review.read(cx).session().1 == cwd {
@@ -1090,11 +1134,13 @@ impl Shell {
             session_row_bounds: HashMap::new(),
             folder_bounds: HashMap::new(),
             sidebar_drop: None,
+            chat_mention_drop: None,
             folder_drag: None,
             skip_folder_click: false,
             filter_anchor: AnchorSlot::default(),
             folder_picker: None,
             pending_folder: None,
+            pending_project_picker: None,
             _session_clock: session_clock,
             notes: None,
             note_count: None,
@@ -1124,6 +1170,7 @@ impl Shell {
             session_preview: None,
             preview_close: None,
             preview_open: None,
+            project_flyout: Default::default(),
             sidebar_last_scroll: None,
             window_observed: false,
             shortcuts: None,
@@ -1143,7 +1190,15 @@ impl Shell {
             pending_project_blanks: HashSet::new(),
             new_tab_task: None,
             worktree_focus,
+            tweak_panel_key: None,
+            working_titles: HashMap::new(),
+            tweak_cancels: HashMap::new(),
+            tweak_requests: HashMap::new(),
+            _tweak_changes: None,
             session_worktrees,
+            agent_changes: HashMap::new(),
+            agent_changes_task: None,
+            agent_changes_dirty: false,
             session_details: sidebar_metadata.details,
             sidebar_hidden_sessions: sidebar_metadata.sidebar_hidden,
             worktree_returns: HashMap::new(),
@@ -1160,6 +1215,7 @@ impl Shell {
             tab_scroll_task: None,
             resize: None,
             git,
+            workspace_folders,
             right_panel: None,
             right_resize: None,
             right_resize_hovered: false,
@@ -1198,6 +1254,7 @@ impl Shell {
             viewport_height: 800.,
             observations: vec![
                 git_observation,
+                workspace_observation,
                 git_changes,
                 resource_observation,
                 resource_stops,
@@ -1212,6 +1269,7 @@ impl Shell {
         }
         this.observe_accounts(cx);
         this.load_note_count(cx);
+        this.refresh_agent_changes(cx);
         this.observe_picker_preferences(cx);
         let mono_owner = cx.weak_entity();
         let mono_active =
@@ -1301,6 +1359,13 @@ impl Shell {
             this.session_summaries.insert(summary.id, summary);
         }
         this.init_mobile_host(cx);
+        // The tab and the menu depend on the list, which is read in the background.
+        this._tweak_changes = crate::tweaks::get(cx).map(|center| {
+            cx.observe(&center, |this, _, cx| {
+                this.invalidate_chrome(cx);
+                cx.notify();
+            })
+        });
         if let Some(id) = this.workspace.active {
             this.ensure_session(this.workspace.session_for_pane(id), cx);
             this.record_worktree_session(id, cx);
@@ -1417,6 +1482,7 @@ impl Shell {
                 this.session_worktrees
                     .insert(id, view.read(cx).settings.worktree_cwd.clone());
                 // A finished turn may have edited files or moved to a worktree.
+                this.refresh_agent_changes(cx);
                 if this.workspace.active == Some(id) {
                     this.sync_git(cx);
                     this.git.update(cx, |git, cx| git.reload(cx));
@@ -1681,6 +1747,8 @@ impl Shell {
         if let (Some(panel), Some(kind)) = (&self.right_panel, provider) {
             let changes = panel.read(cx).changes.clone();
             changes.update(cx, |c, _| c.text_provider = kind);
+            let workspace_changes = panel.read(cx).workspace_changes.clone();
+            workspace_changes.update(cx, |c, cx| c.set_text_provider(kind, cx));
         }
         self.sync_right_panel(cx);
     }
@@ -1808,6 +1876,7 @@ impl Shell {
             return;
         }
         let git = self.git.clone();
+        let folders = self.workspace_folders.clone();
         let (tab, order, view) = (
             self.workspace.right_panel_tab,
             self.workspace.right_panel_tabs.clone(),
@@ -1815,7 +1884,7 @@ impl Shell {
         );
         let terminal_tab = self.terminal_in_panel(cx);
         let panel = cx.new(|cx| {
-            let mut panel = RightPanel::new(git, tab, order, window, cx);
+            let mut panel = RightPanel::new(git, folders, tab, order, window, cx);
             panel.set_terminal_tab(terminal_tab, cx);
             panel
         });
@@ -1885,22 +1954,17 @@ impl Shell {
         self.observations.push(cx.subscribe_in(
             &changes,
             window,
-            |this, _, event: &crate::changes::ChangesEvent, window, cx| match event {
-                crate::changes::ChangesEvent::View(view) => {
-                    this.workspace.changes_view = *view;
-                    this.persist(cx);
-                }
-                crate::changes::ChangesEvent::OpenDiff { cwd, path, staged } => {
-                    this.open_review(
-                        crate::review::ReviewTab::Changes {
-                            cwd: cwd.clone(),
-                            path: path.clone(),
-                            staged: Some(*staged),
-                        },
-                        window,
-                        cx,
-                    );
-                }
+            |this, _, event: &crate::changes::ChangesEvent, window, cx| {
+                this.on_changes_event(event, window, cx)
+            },
+        ));
+        let workspace_changes = panel.read(cx).workspace_changes.clone();
+        workspace_changes.update(cx, |c, cx| c.set_view(view, cx));
+        self.observations.push(cx.subscribe_in(
+            &workspace_changes,
+            window,
+            |this, _, event: &crate::changes::ChangesEvent, window, cx| {
+                this.on_changes_event(event, window, cx)
             },
         ));
         let history = panel.read(cx).history.clone();
@@ -2059,8 +2123,10 @@ impl Shell {
     ) -> Entity<crate::review::ReviewPane> {
         use crate::review::ReviewEvent;
         let git = self.git.clone();
+        let folders = self.workspace_folders.clone();
         let review = cx.new(|cx| {
             let mut pane = crate::review::ReviewPane::new(git, state, cx);
+            pane.follow_workspace(&folders, cx);
             pane.pane_draggable = true;
             pane
         });
@@ -2095,6 +2161,7 @@ impl Shell {
                         this.add_to_chat(owner, text, cx);
                     }
                     ReviewEvent::Empty => this.close_review(id, cx),
+                    ReviewEvent::AgentChanges => this.refresh_agent_changes(cx),
                     ReviewEvent::DragPane(position) => {
                         this.tab_drag = None;
                         this.pane_drag = Some(PaneDrag {
@@ -2111,10 +2178,42 @@ impl Shell {
             },
         ));
         self.reviews.insert(id, review.clone());
+        self.sync_agent_files(cx);
         review
     }
     /// openChangesTab / openCommitTab in the active tab; the pane slides
     /// in beside the chat when it is new.
+    fn on_changes_event(
+        &mut self,
+        event: &crate::changes::ChangesEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            crate::changes::ChangesEvent::View(view) => {
+                self.workspace.changes_view = *view;
+                self.persist(cx);
+            }
+            crate::changes::ChangesEvent::OpenDiff { cwd, path, staged } => {
+                self.open_review(
+                    crate::review::ReviewTab::Changes {
+                        cwd: cwd.clone(),
+                        path: path.clone(),
+                        staged: Some(*staged),
+                    },
+                    window,
+                    cx,
+                );
+            }
+        }
+    }
+    /// The change count the title bar shows: a workspace adds up its repos.
+    pub(super) fn shown_git_stats(&self, cx: &App) -> Option<monocode_core::scm::DiffStats> {
+        self.workspace_folders
+            .read(cx)
+            .total_stats(cx)
+            .or_else(|| self.git.read(cx).stats.clone())
+    }
     fn open_review(
         &mut self,
         tab: crate::review::ReviewTab,
@@ -2820,10 +2919,12 @@ impl Shell {
             .review_slide
             .as_ref()
             .is_some_and(|(sid, _, _)| *sid == id);
+        let swapped = self.panels_swapped();
         div()
             .size_full()
             .relative()
             .flex()
+            .when(swapped, |d| d.flex_row_reverse())
             .child(bounds.layout_probe())
             .when(!chat_hidden, |d| {
                 d.child(
@@ -2858,7 +2959,14 @@ impl Shell {
                     .overflow_hidden()
                     .when(moving, |d| d.opacity(0.4))
                     .when(!chat_hidden, |d| {
-                        d.border_l_1().border_color(crate::right_panel::stroke())
+                        d.map(|d| {
+                            if swapped {
+                                d.border_r_1()
+                            } else {
+                                d.border_l_1()
+                            }
+                        })
+                        .border_color(crate::right_panel::stroke())
                     })
                     .on_mouse_down(
                         MouseButton::Left,
@@ -2904,7 +3012,7 @@ impl Shell {
                         .absolute()
                         .top_0()
                         .bottom_0()
-                        .left(gpui::relative(1. - ratio))
+                        .left(gpui::relative(if swapped { ratio } else { 1. - ratio }))
                         .ml(px(-5.5))
                         .w(px(12.))
                         .cursor(CursorStyle::ResizeLeftRight)
@@ -2940,7 +3048,13 @@ impl Shell {
             return;
         };
         let width = bounds.size.width.as_f32().max(1.);
-        let ratio = (1. - (event.position.x - bounds.left()).as_f32() / width).clamp(0.15, 0.85);
+        let from_left = (event.position.x - bounds.left()).as_f32() / width;
+        let ratio = if self.panels_swapped() {
+            from_left
+        } else {
+            1. - from_left
+        }
+        .clamp(0.15, 0.85);
         review.update(cx, |r, cx| {
             r.state.ratio = ratio;
             cx.notify();
@@ -3521,7 +3635,7 @@ impl Shell {
         self.history.record(id);
         self.workspace.open(id);
         if let Some(view) = self.sessions.get(&id) {
-            self.workspace.project = view.read(cx).summary.cwd.clone();
+            self.workspace.project = self.session_project(id, cx).to_owned();
             self.workspace
                 .project_focus
                 .insert(self.workspace.project.clone(), id);
@@ -3813,6 +3927,12 @@ impl Shell {
                     }
                 })
         };
+        // Over a message box, a sidebar chat is mentioned there, not split.
+        let mention = matches!(source, DragSource::Session(_))
+            .then(|| self.chat_mention_drop_at(event.position, source.session(), cx))
+            .flatten();
+        let over = over.filter(|_| mention.is_none());
+        self.set_chat_mention_drop(mention, cx);
         let drag = self.pane_drag.as_mut().unwrap();
         if !drag.active && matches!(source, DragSource::Session(_)) {
             self.skip_session_click = true;
@@ -3834,6 +3954,7 @@ impl Shell {
         cx.notify();
     }
     fn cancel_pane_drag(&mut self, cx: &mut Context<Self>) {
+        self.set_chat_mention_drop(None, cx);
         if self.sidebar_drop.take().is_some() {
             self.notify_sidebar(cx);
         }
@@ -3851,6 +3972,9 @@ impl Shell {
         self.tabs_frame.update(cx, |_, cx| cx.notify());
         cx.notify();
         if !drag.active {
+            return;
+        }
+        if self.finish_chat_mention_drop(drag.source.session(), window, cx) {
             return;
         }
         if let Some(target) = self.sidebar_drop.take() {
@@ -4080,13 +4204,17 @@ impl Shell {
     }
     fn resume_git(&mut self, cx: &mut Context<Self>) {
         self.git.update(cx, |git, cx| git.resume(cx));
+        self.workspace_folders
+            .update(cx, |folders, cx| folders.resume(cx));
         if let Some(panel) = &self.right_panel {
             let panel = panel.read(cx);
-            let (explorer, changes, history) = (
+            let (explorer, changes, workspace_changes, history) = (
                 panel.explorer.clone(),
                 panel.changes.clone(),
+                panel.workspace_changes.clone(),
                 panel.history.clone(),
             );
+            workspace_changes.update(cx, |c, cx| c.resume(cx));
             explorer.update(cx, |e, cx| e.resume(cx));
             changes.update(cx, |c, cx| c.resume(cx));
             history.update(cx, |h, cx| h.resume(cx));
@@ -4285,13 +4413,18 @@ impl Shell {
         let Some(view) = self.ensure_session(id, cx) else {
             return;
         };
+        self.carry_file_panel(id, cx);
         self.history.record(id);
         self.workspace.open(id);
-        self.workspace.project = view.read(cx).summary.cwd.clone();
+        self.workspace.project = self.session_project(id, cx).to_owned();
         self.workspace
             .project_focus
             .insert(self.workspace.project.clone(), id);
-        self.workspace.collapsed.remove(&self.workspace.project);
+        if !self.project_folders_active() {
+            self.workspace.collapsed.remove(&self.workspace.project);
+        } else {
+            self.note_project_chat_opened(id, cx);
+        }
         view.update(cx, |v, cx| v.load(cx));
         self.record_worktree_session(id, cx);
         self.remember_title_tab(TitleTab::Session(self.workspace.tab_of(id).unwrap()));
@@ -4443,7 +4576,9 @@ impl Shell {
                 self.spaces_start = ix - 4;
             }
         }
-        self.workspace.collapsed.remove(&path);
+        if !self.project_folders_active() {
+            self.workspace.collapsed.remove(&path);
+        }
         // Original-layout project buttons leave the standalone Mono/app view.
         // The new layout restores each project's selected tab, including Monos.
         let remembered_session = self
@@ -4466,11 +4601,7 @@ impl Shell {
                     && self
                         .session_summaries
                         .contains_key(&self.workspace.session_for_pane(*id))
-                    && self
-                        .session_metadata(self.workspace.session_for_pane(*id), cx)
-                        .summary
-                        .cwd
-                        == path
+                    && self.session_project(self.workspace.session_for_pane(*id), cx) == path
                     && self.in_worktree_scope(*id, cx)
             })
             .or_else(|| {
@@ -4483,15 +4614,11 @@ impl Shell {
                             &self
                                 .workspace
                                 .session_for_pane(self.workspace.scope_pane(**id)),
-                        ) && self
-                            .session_metadata(
-                                self.workspace
-                                    .session_for_pane(self.workspace.scope_pane(**id)),
-                                cx,
-                            )
-                            .summary
-                            .cwd
-                            == path
+                        ) && self.session_project(
+                            self.workspace
+                                .session_for_pane(self.workspace.scope_pane(**id)),
+                            cx,
+                        ) == path
                             && self.in_worktree_scope(self.workspace.scope_pane(**id), cx)
                     })
                     .map(|tab| self.workspace.tab_focus(*tab))
@@ -4673,6 +4800,10 @@ impl Shell {
     }
     fn navigation_width(&self) -> f32 {
         let closed = self.traffic_lights() + 3. * 24.;
+        // The sidebar is at the other end, so nothing here spans it.
+        if self.panels_swapped() {
+            return closed;
+        }
         if self.workspace.classic_layout {
             return if self.workspace.project_rail_open || self.settings.is_some() {
                 self.project_rail_drawn_width().max(closed + 6.)
@@ -4714,7 +4845,16 @@ impl Shell {
                     .w(px(self.traffic_lights()))
                     .flex_shrink_0(),
             )
-            .child(self.sidebar_toggle(cx))
+            .map(|d| {
+                // Swapped, the panel at this end is the Explorer's.
+                if !self.panels_swapped() {
+                    d.child(self.sidebar_toggle(cx))
+                } else if let Some(button) = self.right_panel_toggle(cx) {
+                    d.child(button)
+                } else {
+                    d.child(div().size(px(24.)).flex_shrink_0())
+                }
+            })
             .child(titlebar_drag_area().flex_1())
             .child(
                 icon_button_enabled(
@@ -4758,7 +4898,13 @@ impl Shell {
                 .size(px(24.))
                 .child(self.peek_toggle_bounds.probe());
         }
-        icon_button("toggle-sidebar", TOGGLE_SIDEBAR_LABEL, "sidebar")
+        // The icon shows which side the panel it toggles is on.
+        let glyph = if self.panels_swapped() {
+            "sidebar-right"
+        } else {
+            "sidebar"
+        };
+        icon_button("toggle-sidebar", TOGGLE_SIDEBAR_LABEL, glyph)
             .debug_selector(|| "toggle-sidebar".into())
             .child(self.peek_toggle_bounds.probe())
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
@@ -4780,6 +4926,8 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let inline_tabs = panel.read(cx).tabs.clone();
+        let searching = panel.read(cx).explorer.read(cx).search_open();
         let content =
             if let Some(monos) = self.monos.as_ref().filter(|m| m.read(cx).active.is_some()) {
                 let manager = monos.read(cx);
@@ -4803,6 +4951,62 @@ impl Shell {
                     .cached(StyleRefinement::default().size_full())
                     .into_any_element()
             };
+        let swapped = self.panels_swapped();
+        // Swapped, the panel sits under the traffic lights, so its tabs head
+        // the panel instead of sharing the title bar's far corner.
+        let stat = self.project_diff_stat(cx);
+        let tabs = (swapped && !self.mono_active(cx)).then(|| {
+            div()
+                .debug_selector(|| "right-panel-inline-tabs".into())
+                .h(px(TITLE_BAR_HEIGHT))
+                .flex_shrink_0()
+                .px_1p5()
+                .flex()
+                .items_center()
+                .gap(px(2.))
+                .child(
+                    inline_tabs.cached(
+                        StyleRefinement::default()
+                            .w(px(self.project_tabs_width(cx)))
+                            .h(px(TITLE_BAR_HEIGHT)),
+                    ),
+                )
+                .child(
+                    div()
+                        .debug_selector(|| "right-panel-diff-stat".into())
+                        .flex_shrink_0()
+                        .children(stat),
+                )
+                .child(
+                    crate::project_tabs::tab_button(
+                        "right-panel-tab-Search",
+                        "Search",
+                        "search",
+                        searching,
+                        false,
+                        1.,
+                        window,
+                    )
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        let Some(panel) = this.right_panel.clone() else {
+                            return;
+                        };
+                        panel.update(cx, |panel, cx| {
+                            panel.select(crate::right_panel::RightTab::Files, cx);
+                            let explorer = panel.explorer.clone();
+                            explorer.update(cx, |e, cx| e.open_search(window, cx));
+                            panel.tabs.update(cx, |_, cx| cx.notify());
+                        });
+                        cx.notify();
+                    })),
+                )
+        });
+        let content = div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .children(tabs)
+            .child(div().flex_1().min_h_0().child(content));
         div()
             .id("right-panel-frame")
             .debug_selector(|| "right-panel-frame".into())
@@ -4810,7 +5014,13 @@ impl Shell {
             .h_full()
             .flex_shrink_0()
             .w(px(width))
-            .border_l_1()
+            .map(|d| {
+                if swapped {
+                    d.border_r_1()
+                } else {
+                    d.border_l_1()
+                }
+            })
             .border_color(crate::right_panel::stroke())
             // The full-width contents travel with the leading edge instead of
             // reflowing into the growing clip on every animation frame.
@@ -4821,7 +5031,7 @@ impl Shell {
                         .debug_selector(|| "right-panel-content".into())
                         .absolute()
                         .top_0()
-                        .left_0()
+                        .map(|d| if swapped { d.right_0() } else { d.left_0() })
                         .h_full()
                         .w(px(full - 1.))
                         .child(content),
@@ -4832,7 +5042,13 @@ impl Shell {
                     .absolute()
                     .top_0()
                     .bottom_0()
-                    .left(px(-3.5))
+                    .map(|d| {
+                        if swapped {
+                            d.right(px(-3.5))
+                        } else {
+                            d.left(px(-3.5))
+                        }
+                    })
                     .child(resize_border(
                         true,
                         self.right_resize.is_some() || self.right_resize_hovered,
@@ -4916,7 +5132,12 @@ impl Shell {
             return false;
         };
         if event.pressed_button == Some(MouseButton::Left) {
-            let width = width - (event.position.x - start).as_f32();
+            let moved = (event.position.x - start).as_f32();
+            let width = if self.panels_swapped() {
+                width + moved
+            } else {
+                width - moved
+            };
             self.drag_resize(ResizeTarget::RightPanel, width, cx);
         } else {
             self.release_resizes(cx);
@@ -5023,6 +5244,84 @@ impl Shell {
             .into_any()
     }
 
+    /// The button that shows and hides the panel holding Explorer and History.
+    fn right_panel_toggle(&self, cx: &mut Context<Self>) -> Option<gpui::Stateful<gpui::Div>> {
+        let mono = self.mono_active(cx);
+        if !(mono || self.git.read(cx).available()) {
+            return None;
+        }
+        let panel_off = self.app_view_open();
+        let dot = !mono && !panel_off && self.git.read(cx).has_changes();
+        let panel_active = self.workspace.right_panel_open && !panel_off;
+        let ink = if panel_off {
+            content(0.25)
+        } else if panel_active && !self.workspace.boxy_layout() {
+            content(1.)
+        } else {
+            content(0.5)
+        };
+        Some(
+            div()
+                .id("toggle-right-panel")
+                .debug_selector(|| "toggle-right-panel".into())
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .role(Role::Button)
+                .aria_label(if dot {
+                    TOGGLE_RIGHT_PANEL_DOT_LABEL
+                } else {
+                    TOGGLE_RIGHT_PANEL_LABEL
+                })
+                .aria_toggled(if panel_active {
+                    gpui::Toggled::True
+                } else {
+                    gpui::Toggled::False
+                })
+                .group("toggle-right-panel")
+                .cursor_pointer()
+                .size(px(24.))
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_md()
+                .when(!panel_off, |d| d.hover(|s| s.bg(content(0.1))))
+                .child(
+                    div()
+                        .relative()
+                        .size(px(14.))
+                        .child(
+                            icon(
+                                if self.panels_swapped() {
+                                    "sidebar"
+                                } else {
+                                    "sidebar-right"
+                                },
+                                14.,
+                            )
+                            .text_color(ink)
+                            .when(!panel_off, |i| {
+                                i.group_hover("toggle-right-panel", |s| s.text_color(content(1.)))
+                            }),
+                        )
+                        .when(dot, |d| {
+                            d.child(
+                                div()
+                                    .absolute()
+                                    .top(px(-2.))
+                                    .right(px(-2.))
+                                    .size(px(6.))
+                                    .rounded_full()
+                                    .bg(accent_color()),
+                            )
+                        }),
+                )
+                .when(!panel_off, |d| {
+                    d.on_click(
+                        cx.listener(|this, _, window, cx| this.toggle_right_panel(window, cx)),
+                    )
+                }),
+        )
+    }
     /// TitleBar.tsx's right panel toggle, `pl-1.5 pr-3` clear of the edge.
     fn panel_toggle(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let mono = self.mono_active(cx);
@@ -5034,7 +5333,6 @@ impl Shell {
         }
         let toggle = mono || self.git.read(cx).available();
         let panel_off = self.app_view_open();
-        let dot = !mono && !panel_off && self.git.read(cx).has_changes();
         let panel_active = self.workspace.right_panel_open && !panel_off;
         let tabs = if mono && panel_active {
             self.monos.clone().map(|m| {
@@ -5049,7 +5347,7 @@ impl Shell {
         } else {
             self.right_panel
                 .as_ref()
-                .filter(|_| panel_active && !mono)
+                .filter(|_| panel_active && !mono && !self.panels_swapped())
                 .map(|panel| {
                     panel
                         .read(cx)
@@ -5064,6 +5362,14 @@ impl Shell {
                 })
         };
         let show_tabs = tabs.is_some();
+        // Swapped, an open panel carries the stat in its own tab row.
+        let title_stat = if self.panels_swapped() && panel_active && !mono {
+            None
+        } else {
+            self.project_diff_stat(cx)
+        };
+        let swapped = self.panels_swapped();
+        let toggle_button = self.right_panel_toggle(cx);
         div()
             .relative()
             .w(px(self.toggle_room(cx)))
@@ -5076,15 +5382,9 @@ impl Shell {
                     return d
                         .pl_1p5()
                         .pr(px(12. + self.window_controls))
-                        .child(self.file_search_button(cx));
+                        .child(self.file_search_button(cx))
+                        .when(swapped, |d| d.child(self.sidebar_toggle(cx)));
                 }
-                let ink = if panel_off {
-                    content(0.25)
-                } else if panel_active && !self.workspace.boxy_layout() {
-                    content(1.)
-                } else {
-                    content(0.5)
-                };
                 d.child(
                     div()
                         .h_full()
@@ -5102,63 +5402,16 @@ impl Shell {
                             d.child(tabs)
                                 .when(!mono, |d| d.child(titlebar_drag_area().flex_1().min_w_0()))
                         })
-                        .children(self.project_diff_stat(cx))
+                        .children(title_stat)
                         .child(self.file_search_button(cx).mx(px(CORNER_CONTROL_GAP)))
-                        .child(
-                            div()
-                                .id("toggle-right-panel")
-                                .debug_selector(|| "toggle-right-panel".into())
-                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                                .role(Role::Button)
-                                .aria_label(if dot {
-                                    TOGGLE_RIGHT_PANEL_DOT_LABEL
-                                } else {
-                                    TOGGLE_RIGHT_PANEL_LABEL
-                                })
-                                .aria_toggled(if panel_active {
-                                    gpui::Toggled::True
-                                } else {
-                                    gpui::Toggled::False
-                                })
-                                .group("toggle-right-panel")
-                                .cursor_pointer()
-                                .size(px(24.))
-                                .flex_shrink_0()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .rounded_md()
-                                .when(!panel_off, |d| d.hover(|s| s.bg(content(0.1))))
-                                .child(
-                                    div()
-                                        .relative()
-                                        .size(px(14.))
-                                        .child(icon("sidebar-right", 14.).text_color(ink).when(
-                                            !panel_off,
-                                            |i| {
-                                                i.group_hover("toggle-right-panel", |s| {
-                                                    s.text_color(content(1.))
-                                                })
-                                            },
-                                        ))
-                                        .when(dot, |d| {
-                                            d.child(
-                                                div()
-                                                    .absolute()
-                                                    .top(px(-2.))
-                                                    .right(px(-2.))
-                                                    .size(px(6.))
-                                                    .rounded_full()
-                                                    .bg(accent_color()),
-                                            )
-                                        }),
-                                )
-                                .when(!panel_off, |d| {
-                                    d.on_click(cx.listener(|this, _, window, cx| {
-                                        this.toggle_right_panel(window, cx)
-                                    }))
-                                }),
-                        ),
+                        // Each button closes the panel on its own side.
+                        .map(|d| {
+                            if swapped {
+                                d.child(self.sidebar_toggle(cx))
+                            } else {
+                                d.children(toggle_button)
+                            }
+                        }),
                 )
             })
             .when(show_tabs && !self.workspace.boxy_layout(), |d| {
@@ -5201,7 +5454,7 @@ impl Shell {
                 .as_ref()
                 .is_some_and(|p| p.read(cx).tab() == crate::right_panel::RightTab::Changes);
         (width > 0.).then(|| {
-            crate::right_panel::diff_stat(self.git.read(cx).stats.as_ref(), width)
+            crate::right_panel::diff_stat(self.shown_git_stats(cx).as_ref(), width)
                 .when(selected, |d| d.bg(content(0.1)))
                 .when(!self.app_view_open(), |d| {
                     d.cursor_pointer()
@@ -5242,8 +5495,8 @@ impl Shell {
         if self.mono_active(cx) || !self.git.read(cx).available() {
             return 0.;
         }
-        let natural = crate::right_panel::diff_stat_width(self.git.read(cx).stats.as_ref());
-        if !self.workspace.right_panel_open || self.app_view_open() {
+        let natural = crate::right_panel::diff_stat_width(self.shown_git_stats(cx).as_ref());
+        if self.panels_swapped() || !self.workspace.right_panel_open || self.app_view_open() {
             return natural;
         }
         let controls = crate::right_panel::tab_icons_width(self.right_tab_count(cx))
@@ -5254,6 +5507,13 @@ impl Shell {
         natural.min((self.right_panel_width() - controls).max(48.))
     }
     fn project_tabs_width(&self, cx: &App) -> f32 {
+        if self.panels_swapped() {
+            let count = self.right_tab_count(cx);
+            // The row's padding and gaps, the stat, and the Search tab.
+            let taken = 12. + 6. + self.diff_stat_room(cx) + SEARCH_TAB_ROOM;
+            return (self.right_panel_width() - taken)
+                .max(crate::right_panel::tab_icons_width(count));
+        }
         let padding = if self.workspace.boxy_layout() {
             24.
         } else {
@@ -5272,7 +5532,7 @@ impl Shell {
     /// Explorer and History, and Terminal when it lives in the panel. Changes
     /// opens from the diff stat instead.
     fn right_tab_count(&self, cx: &App) -> usize {
-        2 + usize::from(self.terminal_in_panel(cx))
+        2 + usize::from(self.terminal_in_panel(cx)) + usize::from(self.tweak_tab_shown(cx))
     }
     /// The toggle's room at the end of the strip: `pl-1.5`, the button, `pr-3`.
     fn toggle_room(&self, cx: &App) -> f32 {
@@ -5290,6 +5550,9 @@ impl Shell {
                         252.
                     };
                     return (self.right_drawn + 7.).max(minimum + controls);
+                }
+                if self.panels_swapped() {
+                    return 6. + CORNER_BUTTONS_WIDTH + 12. + controls;
                 }
                 // Follow the rounded panel's left edge, including the card's
                 // right inset, while keeping room for all controls when narrow.
@@ -5479,6 +5742,9 @@ impl Shell {
                         .disabled(count < 2 && !closable)
                         .into(),
                 ];
+                if let MenuTarget::Tab(id) = target {
+                    items.extend(self.move_to_project_items(self.workspace.tab_focus(*id), cx));
+                }
                 // Closing a tab keeps its session; archive also hides it from
                 // the active history while preserving everything on disk.
                 if let Some(id) = tab.session().filter(|id| {
@@ -5639,6 +5905,25 @@ impl Shell {
                 )
             }
             // SidebarWorktreeSwitcher's menu under the project header.
+            // The project list's plus: the list already does the switching.
+            MenuTarget::Header if self.project_folders_active() => (
+                "Open project menu".into(),
+                vec![
+                    MenuAction::new("open-project", "Open folder…")
+                        .icon("folder")
+                        .into(),
+                    MenuAction::new("open-remote-project", "Open folder on a machine…")
+                        .icon("globe")
+                        .into(),
+                    MenuItem::Separator,
+                    MenuAction::new("settings", "Settings")
+                        .icon("settings")
+                        .shortcut(format!("{MOD},"))
+                        .into(),
+                ],
+                240.,
+                MenuStyle::Switcher,
+            ),
             MenuTarget::Header => {
                 let picker = cx.new(|cx| {
                     ProjectPicker::new(&self.workspace.projects, &self.workspace.project, cx)
@@ -5739,13 +6024,33 @@ impl Shell {
                 let mut items: Vec<MenuItem> = vec![
                     MenuItem::Custom(controls.clone().into(), controls.read(cx).focus(cx)),
                     MenuItem::Separator,
+                ];
+                // The project list has no header menu to hold the worktree switch.
+                if self.project_folders_active() && *path == self.workspace.project {
+                    let branch = self
+                        .worktree_focus
+                        .get(path)
+                        .and_then(|focus| focus.branch.clone())
+                        .or_else(|| crate::conversation::git_branch(std::path::Path::new(path)));
+                    let worktree = MenuAction::new("switch-worktree", "Switch worktree")
+                        .icon("folder-tree")
+                        .flyout(self.worktree_flyout(events, window, cx));
+                    items.push(
+                        match branch {
+                            Some(branch) => worktree.value(branch),
+                            None => worktree,
+                        }
+                        .into(),
+                    );
+                }
+                items.extend::<[MenuItem; 2]>([
                     MenuAction::new("project-theme", "Theme colors")
                         .icon("palette")
                         .into(),
                     MenuAction::new("background", "Background image")
                         .icon("image-add")
                         .into(),
-                ];
+                ]);
                 if *rail {
                     let mut groups = vec![MenuAction::new("project-group:new", "New group…")];
                     if self.workspace.project_rail_assignments.contains_key(path) {
@@ -5780,11 +6085,12 @@ impl Shell {
                 if peers.len() > 1 {
                     let ix = peers.iter().position(|p| p == path).unwrap_or(0);
                     let (first, last) = (ix == 0, ix + 1 == peers.len());
-                    let (back, forward) = if self.workspace.classic_layout {
-                        ("Move up", "Move down")
-                    } else {
-                        ("Move left", "Move right")
-                    };
+                    let (back, forward) =
+                        if self.workspace.classic_layout || self.project_folders_active() {
+                            ("Move up", "Move down")
+                        } else {
+                            ("Move left", "Move right")
+                        };
                     let shortcut = |command| {
                         crate::settings::command_shortcut(&self.workspace.preferences, command)
                     };
@@ -5838,6 +6144,11 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let MenuTarget::Tab(id) = target
+            && let Some(path) = action.strip_prefix(move_chat::MOVE_TO_PROJECT)
+        {
+            return self.move_tab_to_project(id, path, window, cx);
+        }
         if let MenuTarget::Tab(id) = target {
             match action {
                 "archive" => return self.toggle_archive(id, cx),
@@ -5896,6 +6207,8 @@ impl Shell {
                 // "Project settings" opens the project's menu beside its row.
                 if action == "settings" {
                     self.open_settings(crate::settings::Section::General, window, cx);
+                } else if action == "open-project" {
+                    self.open_project(cx);
                 } else if action == "open-remote-project" {
                     self.open_remote_project(window, cx);
                 } else if action == "project-settings" {
@@ -5959,6 +6272,11 @@ impl Shell {
         }
     }
     fn close_preview(&mut self, cx: &mut Context<Self>) {
+        self.close_session_preview(cx);
+        self.close_project_flyout(cx);
+    }
+    /// Closes only a chat's preview card, leaving a project's popover open.
+    fn close_session_preview(&mut self, cx: &mut Context<Self>) {
         self.preview_open = None;
         self.preview_close = None;
         if self.session_preview.take().is_some() {
@@ -6053,7 +6371,8 @@ impl Shell {
                 .as_ref()
                 .is_none_or(|preview| preview.id != id)
             {
-                self.close_preview(cx);
+                // Crossing a chat on the way to a project's popover keeps it.
+                self.close_session_preview(cx);
                 self.schedule_preview(id, anchor, cx);
             }
         } else {
@@ -6280,7 +6599,7 @@ impl Shell {
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(content(1.))
             })
-            .child(crate::particle_text::particle_text(session.display_title()));
+            .child(self.session_title_text(id, session.display_title(), 20.));
         let badges = div()
             .flex()
             .items_center()
@@ -6535,6 +6854,9 @@ impl Shell {
         cx: &Context<Self>,
     ) -> AnyElement {
         let detailed = !compact;
+        if let Some(button) = self.peeked_close_button(id, cx) {
+            return button;
+        }
         if self.session_hover == Some(id) {
             return self.session_archive_button(id, session, cx);
         }
@@ -6605,6 +6927,14 @@ impl Shell {
 
     /// The project's sessions as the sidebar lists them, top to bottom.
     fn sidebar_session_ids(&self, cx: &App) -> Vec<i64> {
+        if self.project_list_showing() {
+            return self.project_folder_visible_ids(cx);
+        }
+        self.listed_session_ids(|cwd| cwd == self.workspace.project, cx)
+    }
+    /// Sessions the sidebar may list from the projects `in_project` accepts,
+    /// newest first, after its visibility, filter and search rules.
+    fn listed_session_ids(&self, in_project: impl Fn(&str) -> bool, cx: &App) -> Vec<i64> {
         let start = self
             .workspace
             .session_filters
@@ -6618,7 +6948,7 @@ impl Shell {
                 .monos
                 .as_ref()
                 .is_some_and(|m| m.read(cx).hidden_session(id))
-                && s.summary.cwd == self.workspace.project
+                && in_project(self.session_project(id, cx))
                 && s.summary.has_messages
                 && !self.orchestration_worker(id)
                 && self.in_sidebar_worktree_scope(id, cx)
@@ -6807,97 +7137,136 @@ impl Shell {
                                 .flex()
                                 .items_center()
                                 .gap_1()
-                                .child(
-                                    div().flex_1().min_w_0().flex().items_center().child(
-                                        div()
-                                            .id("workspace-project")
-                                            .debug_selector(|| "sidebar-project-button".into())
-                                            .relative()
-                                            .role(Role::Button)
-                                            .aria_label(format!(
-                                                "Switch project, {}",
-                                                self.project_label(&self.workspace.project)
-                                            ))
-                                            .aria_description(self.workspace.project.clone())
-                                            .aria_expanded(self.menu_open(&MenuTarget::Header))
-                                            .cursor_pointer()
-                                            .h(px(28.))
-                                            // The whole picker shares Search's left edge.
-                                            .px_1p5()
-                                            .ml(px(-4.))
-                                            .rounded_md()
-                                            .max_w_full()
-                                            .hover(|s| s.bg(content(0.08)))
-                                            .when(self.menu_open(&MenuTarget::Header), |d| {
-                                                d.bg(content(0.08))
-                                            })
-                                            .min_w_0()
-                                            .flex()
-                                            .items_center()
-                                            .gap_1p5()
-                                            .text_size(px(13.))
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .child(crate::project_settings::header_project_icon(
-                                                &self.appearance(&self.workspace.project),
-                                                &self.workspace.project,
-                                            ))
-                                            .child(
-                                                div().min_w_0().truncate().child(
-                                                    self.project_label(&self.workspace.project),
-                                                ),
-                                            )
-                                            .when_some(
-                                                self.worktree_focus.get(&self.workspace.project),
-                                                |d, focus| {
-                                                    d.child(
-                                                        div()
-                                                            .min_w_0()
-                                                            .truncate()
-                                                            .font_weight(FontWeight::NORMAL)
-                                                            .text_color(content(0.45))
-                                                            .child(
-                                                                focus
-                                                                    .branch
-                                                                    .clone()
-                                                                    .unwrap_or_else(|| {
-                                                                        "detached".into()
-                                                                    }),
-                                                            ),
-                                                    )
-                                                },
-                                            )
-                                            .child(icon("chevron-down", 14.))
-                                            .child(self.project_anchor.probe())
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                if this.menu_open(&MenuTarget::Header) {
-                                                    this.close_menu(cx);
-                                                } else {
-                                                    let anchor =
-                                                        Anchor::Slot(this.project_anchor.clone());
-                                                    this.open_menu(
-                                                        MenuTarget::Header,
-                                                        anchor,
-                                                        window,
-                                                        cx,
-                                                    );
-                                                }
-                                            })),
-                                    ),
+                                // The project list's header holds a full-width Search field.
+                                .when(self.project_list_showing(), |d| {
+                                    if self.workspace.sidebar_search_visible {
+                                        d.child(
+                                            self.sidebar_search_field(true, cx)
+                                                .flex_1()
+                                                .min_w_0()
+                                                .h(px(28.))
+                                                .ml(px(-4.))
+                                                .when(self.app_search.is_some(), |d| {
+                                                    d.bg(gpui::black().opacity(0.32))
+                                                        .text_color(content(1.))
+                                                }),
+                                        )
+                                    } else {
+                                        d.child(div().flex_1())
+                                    }
+                                })
+                                .when(
+                                    self.project_folders_active() && !self.project_list_showing(),
+                                    |d| {
+                                        d.child(self.project_list_back_button(cx))
+                                            .child(div().flex_1())
+                                    },
                                 )
-                                .when(self.workspace.sidebar_search_visible, |d| {
+                                .when(!self.project_folders_active(), |d| {
                                     d.child(
-                                        icon_button("sidebar-search", "Search", "search")
-                                            .debug_selector(|| "sidebar-search-button".into())
-                                            .when(self.app_search.is_some(), |d| d.bg(content(0.1)))
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                if this.app_search.is_some() {
-                                                    this.close_app_search(window, cx)
-                                                } else {
-                                                    this.focus_search(window, cx)
-                                                }
-                                            })),
+                                        div().flex_1().min_w_0().flex().items_center().child(
+                                            div()
+                                                .id("workspace-project")
+                                                .debug_selector(|| "sidebar-project-button".into())
+                                                .relative()
+                                                .role(Role::Button)
+                                                .aria_label(format!(
+                                                    "Switch project, {}",
+                                                    self.project_label(&self.workspace.project)
+                                                ))
+                                                .aria_description(self.workspace.project.clone())
+                                                .aria_expanded(self.menu_open(&MenuTarget::Header))
+                                                .cursor_pointer()
+                                                .h(px(28.))
+                                                // The whole picker shares Search's left edge.
+                                                .px_1p5()
+                                                .ml(px(-4.))
+                                                .rounded_md()
+                                                .max_w_full()
+                                                .hover(|s| s.bg(content(0.08)))
+                                                .when(self.menu_open(&MenuTarget::Header), |d| {
+                                                    d.bg(content(0.08))
+                                                })
+                                                .min_w_0()
+                                                .flex()
+                                                .items_center()
+                                                .gap_1p5()
+                                                .text_size(px(13.))
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .child(
+                                                    crate::project_settings::header_project_icon(
+                                                        &self.appearance(&self.workspace.project),
+                                                        &self.workspace.project,
+                                                    ),
+                                                )
+                                                .child(div().min_w_0().truncate().child(
+                                                    self.project_label(&self.workspace.project),
+                                                ))
+                                                .when_some(
+                                                    self.worktree_focus
+                                                        .get(&self.workspace.project),
+                                                    |d, focus| {
+                                                        d.child(
+                                                            div()
+                                                                .min_w_0()
+                                                                .truncate()
+                                                                .font_weight(FontWeight::NORMAL)
+                                                                .text_color(content(0.45))
+                                                                .child(
+                                                                    focus
+                                                                        .branch
+                                                                        .clone()
+                                                                        .unwrap_or_else(|| {
+                                                                            "detached".into()
+                                                                        }),
+                                                                ),
+                                                        )
+                                                    },
+                                                )
+                                                .child(icon("chevron-down", 14.))
+                                                .children(self.agent_changes_badge(
+                                                    &self.workspace.project.clone(),
+                                                    cx,
+                                                ))
+                                                .child(self.project_anchor.probe())
+                                                .on_click(cx.listener(|this, _, window, cx| {
+                                                    if this.menu_open(&MenuTarget::Header) {
+                                                        this.close_menu(cx);
+                                                    } else {
+                                                        let anchor = Anchor::Slot(
+                                                            this.project_anchor.clone(),
+                                                        );
+                                                        this.open_menu(
+                                                            MenuTarget::Header,
+                                                            anchor,
+                                                            window,
+                                                            cx,
+                                                        );
+                                                    }
+                                                })),
+                                        ),
                                     )
                                 })
+                                .when(
+                                    self.workspace.sidebar_search_visible
+                                        && !self.project_list_showing(),
+                                    |d| {
+                                        d.child(
+                                            icon_button("sidebar-search", "Search", "search")
+                                                .debug_selector(|| "sidebar-search-button".into())
+                                                .when(self.app_search.is_some(), |d| {
+                                                    d.bg(content(0.1))
+                                                })
+                                                .on_click(cx.listener(|this, _, window, cx| {
+                                                    if this.app_search.is_some() {
+                                                        this.close_app_search(window, cx)
+                                                    } else {
+                                                        this.focus_search(window, cx)
+                                                    }
+                                                })),
+                                        )
+                                    },
+                                )
                                 .child(
                                     icon_button(
                                         "sidebar-options",
@@ -6938,14 +7307,20 @@ impl Shell {
                         }),
                 ),
             )
-            .when(!self.workspace.classic_layout, |d| {
-                d.child(self.project_spaces(cx))
-            })
+            .when(
+                !self.workspace.classic_layout && !self.project_folders_active(),
+                |d| d.child(self.project_spaces(cx)),
+            )
+            .children(self.project_flyout_popover(cx))
             .when_some(self.session_preview.as_ref(), |d, preview| {
                 let id = preview.id;
                 d.child(
                     popover("session-preview", Anchor::Slot(preview.anchor.clone()))
-                        .side(Side::Right)
+                        .side(if self.panels_swapped() {
+                            Side::Left
+                        } else {
+                            Side::Right
+                        })
                         .gap(8.)
                         .width(260.)
                         .max_height(440.)
@@ -7236,6 +7611,9 @@ impl Shell {
             let title = self.session_metadata(*id, cx).display_title();
             if title == "New session" {
                 String::new()
+            } else if let Some(folder) = self.moved_session_folder(*id, cx) {
+                // The agent still works there, whichever project lists it.
+                format!("{folder} · {title}")
             } else {
                 title
             }
@@ -7614,7 +7992,8 @@ impl Shell {
         let Some(from) = tabs.iter().position(|tab| *tab == id) else {
             return;
         };
-        if tabs.len() < 2 {
+        // A lone tab has nowhere to go in the strip, but it can change project.
+        if tabs.len() < 2 && !self.project_list_showing() {
             return;
         }
         let bounds: Vec<_> = (0..tabs.len())
@@ -7706,6 +8085,19 @@ impl Shell {
             },
             insert: None,
         });
+        let drop = match &id {
+            TitleTab::Session(tab) if armed => {
+                let chat = self
+                    .workspace
+                    .session_for_pane(self.workspace.tab_focus(*tab));
+                self.project_drop_at(event.position, chat, cx)
+            }
+            _ => None,
+        };
+        if self.sidebar_drop != drop {
+            self.sidebar_drop = drop;
+            self.notify_sidebar(cx);
+        }
         if armed || was {
             cx.notify();
         }
@@ -7713,6 +8105,15 @@ impl Shell {
     }
     fn finish_tab_drag(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(drag) = self.tab_drag.take() {
+            if let (Some(session_groups::ListDrop::Project(path)), TitleTab::Session(tab)) =
+                (self.sidebar_drop.clone(), &drag.id)
+            {
+                self.sidebar_drop = None;
+                self.pane_drag = None;
+                self.skip_tab_click = true;
+                self.move_tab_to_project(*tab, &path, window, cx);
+                return;
+            }
             let onto_pane = self.pane_drag.as_ref().is_some_and(|d| {
                 d.over.is_some()
                     && match d.source {
@@ -8535,6 +8936,7 @@ fn enter_from(leaf: &LayoutLeaf) -> (Edge, Rect) {
 }
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_tweak_panel(window, cx);
         self.keep_visible_idle_agents(cx);
         self.sync_ui_scale(window, cx);
         if self.mono_panes_unsettled(cx) {
@@ -8576,7 +8978,9 @@ impl Render for Shell {
         } else {
             crate::right_panel::WIDTH_MIN
         };
-        self.right_panel_min = tools + self.window_controls;
+        // Swapped, four named tabs share the panel's width.
+        let floor = if self.panels_swapped() { 328. } else { 0. };
+        self.right_panel_min = (tools + self.window_controls).max(floor);
         #[cfg(target_os = "linux")]
         {
             let client = matches!(
@@ -8750,12 +9154,16 @@ impl Render for Shell {
         self.git.update(cx, |git, cx| {
             git.set_polling(poll_git && git.available(), cx)
         });
+        self.workspace_folders
+            .update(cx, |folders, cx| folders.set_polling(poll_git, cx));
         if let Some(panel) = &self.right_panel {
             let classic = self.workspace.boxy_layout();
             let tab_width = self.project_tabs_width(cx);
+            let swapped = self.panels_swapped();
             panel.update(cx, |p, cx| {
                 p.set_top_inset(if classic { TITLE_BAR_HEIGHT } else { 0. }, cx);
                 p.set_tab_width(tab_width, cx);
+                p.set_expanded_tabs(swapped, cx);
                 p.set_show_excluded(self.workspace.preferences.show_excluded_files, cx);
             });
         }
@@ -8824,7 +9232,8 @@ impl Render for Shell {
                         .get()
                         .is_some_and(|bounds| bounds.contains(&event.position))
                 }) {
-                    this.close_preview(cx);
+                    // A press in a project's popover must reach its chat.
+                    this.close_session_preview(cx);
                 }
             }))
             .on_action(
@@ -9203,7 +9612,12 @@ impl Render for Shell {
                 }
                 if let Some((start, width)) = this.resize {
                     if event.pressed_button == Some(MouseButton::Left) {
-                        let width = width + (event.position.x - start).as_f32();
+                        let moved = (event.position.x - start).as_f32();
+                        let width = if this.panels_swapped() {
+                            width - moved
+                        } else {
+                            width + moved
+                        };
                         this.drag_resize(ResizeTarget::Sidebar, width, cx);
                     } else {
                         this.release_resizes(cx);

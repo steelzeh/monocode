@@ -247,6 +247,7 @@ pub(crate) struct SettingsView {
     mcp_filter: String,
     fields: HashMap<&'static str, Entity<Input>>,
     connections: pages::ConnectionsState,
+    tweak_install: pages::TweakInstall,
     skill_preview: Option<std::path::PathBuf>,
     skill_preview_text: Option<Result<std::sync::Arc<skill_document::DocumentData>, String>>,
     skill_preview_generation: u64,
@@ -339,6 +340,9 @@ impl SettingsView {
         if let Some(center) = crate::accounts::get(cx) {
             subscriptions.push(cx.observe(&center, |_, _, cx| cx.notify()));
         }
+        if let Some(center) = crate::tweaks::get(cx) {
+            subscriptions.push(cx.observe(&center, |_, _, cx| cx.notify()));
+        }
         let recorder = cx.weak_entity();
         subscriptions.push(cx.intercept_keystrokes(move |event, window, cx| {
             let _ = recorder.update(cx, |this, cx| {
@@ -397,6 +401,7 @@ impl SettingsView {
             mcp_filter: "all".into(),
             fields: HashMap::new(),
             connections: pages::ConnectionsState::default(),
+            tweak_install: pages::TweakInstall::default(),
             skill_preview: None,
             skill_preview_text: None,
             skill_preview_generation: 0,

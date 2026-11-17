@@ -21,6 +21,7 @@ Actions:
 models.list {}
 sessions.list {project?}
 sessions.read {sessionId,project?,before?,limit?,maxChars?}
+sessions.title {sessionId?,project?}; sessions.rename {sessionId?,title,project?};
 sessions.start {prompt,project?,harness?,model?,modelSettings?,effort?,runtimeMode?,title?,draft?,reveal?,workspaceMode?,worktreeBase?,worktreeCwd?,placement?,besideSessionId?,notifyOnComplete?}
 sessions.send {sessionId,prompt,project?,notifyOnComplete?}
 sessions.draft {sessionId,prompt,project?}
@@ -37,6 +38,8 @@ habits.list {}; habits.add {name,instructions,schedule:{kind,time?,minute?,dayOf
 chat.card {type:"pr",repo?,number,note?} / {type:"session",sessionId,note?} / {type:"choices",options:[text]} / {type:"habit",name,instructions,schedule}
 Ordinary Operator sessions are visible in project history. Mono launches follow its Show started sessions preference. reveal defaults to false and controls navigation, not history visibility. placement right/down explicitly opens a split beside besideSessionId (or the caller).
 sessions.read returns up to three prose exchanges and nextBefore for older turns; pass that turn ID as before.
+A chat the user linked with @chat in a message may use sessions.read and sessions.send on that chat, in any project and without Operator. A sent message waits there until the current turn ends.
+Title actions default to the calling session. sessions.rename sets an exact title, which later automatic naming keeps.
 notes.write requires body for a new note; existing notes accept title, body or tags independently.
 Artifacts, memory, soul, habits, cards and notifyOnComplete:true require a Mono.
 The CLI returns {ok,result,requestId}. Retry uncertain mutations with the same request ID and identical input.
@@ -50,12 +53,32 @@ struct Wire {
     action: String,
     input: Value,
 }
+/// Where an action's result goes: a waiting thread, or an in-app caller.
+pub enum Reply {
+    Thread(mpsc::Sender<Result<Value, String>>),
+    App(async_channel::Sender<Result<Value, String>>),
+}
+impl Reply {
+    /// False when the caller has gone away.
+    pub fn send(&self, result: Result<Value, String>) -> bool {
+        match self {
+            Self::Thread(sender) => sender.send(result).is_ok(),
+            Self::App(sender) => sender.try_send(result).is_ok(),
+        }
+    }
+}
+impl From<mpsc::Sender<Result<Value, String>>> for Reply {
+    fn from(sender: mpsc::Sender<Result<Value, String>>) -> Self {
+        Self::Thread(sender)
+    }
+}
+
 pub struct Call {
     pub session: i64,
     pub request_id: String,
     pub action: String,
     pub input: Value,
-    pub reply: mpsc::Sender<Result<Value, String>>,
+    pub reply: Reply,
 }
 pub struct Server {
     endpoint: String,
@@ -167,7 +190,7 @@ fn serve(
         request_id: request_id.clone(),
         action: wire.action,
         input: wire.input,
-        reply,
+        reply: reply.into(),
     })
     .map_err(|_| "App closed")?;
     let response = match result.recv_timeout(Duration::from_secs(60)) {
@@ -334,6 +357,88 @@ pub fn configure_codex(
     }
 }
 
+/// Every chat's own small MCP server: it reads and changes only the title of
+/// the chat it runs in, through the same session capability.
+pub const CHAT_MCP_SERVER: &str = "monocode_chat";
+pub const CLAUDE_CHAT_ALLOWED_TOOLS: &str = "mcp__monocode_chat";
+const CHAT_TOOL: &str = "chat_title";
+
+/// The title server for a chat that has no Mono app tool, with this app as
+/// its executable. Background helpers (`text_only`) never get it.
+pub fn chat_mcp_server(
+    mono: Option<&crate::agent::MonoContext>,
+    environment: &HashMap<String, String>,
+) -> Option<Value> {
+    if mono.is_some() || !configured(environment) {
+        return None;
+    }
+    let executable = std::env::current_exe().ok()?;
+    Some(json!({"type":"stdio","command":executable.to_string_lossy(),"args":["chat-mcp"]}))
+}
+pub fn chat_acp_server(
+    mono: Option<&crate::agent::MonoContext>,
+    environment: &HashMap<String, String>,
+) -> Option<Value> {
+    let mut server = chat_mcp_server(mono, environment)?;
+    server.as_object_mut()?.remove("type");
+    server["name"] = CHAT_MCP_SERVER.into();
+    server["env"] = ENV_KEYS
+        .iter()
+        .map(|key| json!({"name":key,"value":environment[*key]}))
+        .collect::<Vec<_>>()
+        .into();
+    Some(server)
+}
+pub fn configure_codex_chat(
+    command: &mut std::process::Command,
+    mono: Option<&crate::agent::MonoContext>,
+    environment: &HashMap<String, String>,
+) {
+    let Some(server) = chat_mcp_server(mono, environment) else {
+        return;
+    };
+    for (key, value) in [
+        ("command", server["command"].clone()),
+        ("args", server["args"].clone()),
+        ("env_vars", json!(ENV_KEYS)),
+        // The app allows each chat only its own title.
+        ("default_tools_approval_mode", json!("approve")),
+    ] {
+        command.args([
+            "-c",
+            &format!("mcp_servers.{CHAT_MCP_SERVER}.{key}={value}"),
+        ]);
+    }
+}
+pub fn chat_tool_definitions() -> Vec<Value> {
+    vec![json!({
+        "name": CHAT_TOOL,
+        "description": "Read or change the title of this MonoCode chat, as shown in the sidebar and tab. read returns the current title. rename sets an exact title (up to 120 characters), which automatic naming then keeps. Only this chat can be changed.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["read", "rename"]},
+                "title": {"type": "string", "maxLength": 120, "description": "The new title, for rename"}
+            },
+            "required": ["action"],
+            "additionalProperties": false
+        },
+        "annotations": {"openWorldHint": false}
+    })]
+}
+/// The chat tool's call as an app action on the calling session.
+fn chat_call(arguments: &Value) -> Result<Value, String> {
+    let (action, input) = match arguments["action"].as_str() {
+        Some("read") => ("sessions.title", json!({})),
+        Some("rename") => (
+            "sessions.rename",
+            json!({"title": arguments["title"].as_str().ok_or("rename needs a title")?}),
+        ),
+        _ => return Err("action must be read or rename".into()),
+    };
+    call(action.to_owned(), input, super::new_id())
+}
+
 pub fn tool_definitions() -> Vec<Value> {
     vec![json!({
         "name": "app",
@@ -352,19 +457,31 @@ pub fn tool_definitions() -> Vec<Value> {
     })]
 }
 
+#[cfg(test)]
 fn mcp_response(request: Value) -> Option<Value> {
+    serve_mcp(request, false)
+}
+fn serve_mcp(request: Value, chat: bool) -> Option<Value> {
     let id = request.get("id")?.clone();
+    let server = if chat { CHAT_MCP_SERVER } else { MCP_SERVER };
     let result = match request["method"].as_str().unwrap_or("") {
         "initialize" => Ok(json!({
             "protocolVersion": request["params"]["protocolVersion"].as_str().unwrap_or("2024-11-05"),
             "capabilities": {"tools": {"listChanged": false}},
-            "serverInfo": {"name": MCP_SERVER, "version": env!("CARGO_PKG_VERSION")}
+            "serverInfo": {"name": server, "version": env!("CARGO_PKG_VERSION")}
         })),
         "ping" => Ok(json!({})),
+        "tools/list" if chat => Ok(json!({"tools": chat_tool_definitions()})),
         "tools/list" => Ok(json!({"tools": tool_definitions()})),
         "tools/call" => {
             let arguments = &request["params"]["arguments"];
-            let result = if request["params"]["name"].as_str() != Some("app") {
+            let result = if chat {
+                if request["params"]["name"].as_str() == Some(CHAT_TOOL) {
+                    chat_call(arguments)
+                } else {
+                    Err("Unknown MonoCode chat tool".to_string())
+                }
+            } else if request["params"]["name"].as_str() != Some("app") {
                 Err("Unknown MonoCode app tool".to_string())
             } else if let Some(action) = arguments["action"].as_str() {
                 let input = match &arguments["input"] {
@@ -397,6 +514,13 @@ fn mcp_response(request: Value) -> Option<Value> {
 
 /// Runs before GUI initialization. stdout carries MCP JSON-RPC frames only.
 pub fn mcp_stdio() -> Result<(), String> {
+    stdio(false)
+}
+/// The chat title server: `monocode-gpui chat-mcp`.
+pub fn chat_mcp_stdio() -> Result<(), String> {
+    stdio(true)
+}
+fn stdio(chat: bool) -> Result<(), String> {
     const MAX_FRAME: usize = 4 * 1024 * 1024;
     let mut input = std::io::stdin().lock();
     let mut output = std::io::stdout().lock();
@@ -413,7 +537,7 @@ pub fn mcp_stdio() -> Result<(), String> {
             return Err("Oversized or incomplete MCP frame".into());
         }
         let response = match serde_json::from_str(&line) {
-            Ok(request) => mcp_response(request),
+            Ok(request) => serve_mcp(request, chat),
             Err(_) => Some(
                 json!({"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error"}}),
             ),
@@ -452,6 +576,42 @@ mod capability_tests {
             let _ = BufReader::new(stream).read_line(&mut result);
             serde_json::from_str(&result).ok()
         })
+    }
+    #[test]
+    fn every_plain_chat_gets_only_its_own_title_tool() {
+        let mono = crate::agent::MonoContext {
+            mono: Default::default(),
+            root: "/monos".into(),
+            executable: "/bin/monocode-gpui".into(),
+        };
+        let (server, _rx) = Server::start().unwrap();
+        let environment = server.environment(7);
+        assert!(chat_mcp_server(None, &HashMap::new()).is_none());
+        assert!(chat_mcp_server(Some(&mono), &environment).is_none());
+        let chat = chat_mcp_server(None, &environment).unwrap();
+        assert_eq!(chat["args"], json!(["chat-mcp"]));
+        assert_eq!(
+            chat_acp_server(None, &environment).unwrap()["name"],
+            CHAT_MCP_SERVER
+        );
+        let mut codex = std::process::Command::new("codex");
+        configure_codex_chat(&mut codex, None, &environment);
+        assert!(codex.get_args().any(|arg| arg
+            .to_string_lossy()
+            .starts_with("mcp_servers.monocode_chat.command=")));
+        let list = serve_mcp(json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}), true).unwrap();
+        let tools = list["result"]["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["name"], CHAT_TOOL);
+        let app = serve_mcp(json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"app","arguments":{"action":"sessions.list"}}}), true).unwrap();
+        assert_eq!(app["result"]["isError"], true);
+        let bad = serve_mcp(json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":CHAT_TOOL,"arguments":{"action":"delete"}}}), true).unwrap();
+        assert_eq!(bad["result"]["isError"], true);
+        let untitled = serve_mcp(json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":CHAT_TOOL,"arguments":{"action":"rename"}}}), true).unwrap();
+        assert_eq!(
+            untitled["result"]["content"][0]["text"],
+            "rename needs a title"
+        );
     }
     #[test]
     fn mcp_server_offers_one_app_tool_only_to_a_mono_with_app_access() {
@@ -514,7 +674,7 @@ mod capability_tests {
             std::thread::sleep(Duration::from_millis(5));
         };
         assert_eq!(call.session, 7);
-        call.reply.send(Ok(json!({"models":[]}))).unwrap();
+        assert!(call.reply.send(Ok(json!({"models":[]}))));
         assert_eq!(request.join().unwrap().unwrap()["ok"], true);
     }
 }

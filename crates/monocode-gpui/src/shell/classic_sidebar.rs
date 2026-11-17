@@ -455,7 +455,8 @@ impl Shell {
     }
 
     fn classic_workspace_tabs(&self, cx: &Context<Self>) -> AnyElement {
-        let stats = self.git.read(cx).stats.as_ref();
+        let stats = self.shown_git_stats(cx);
+        let stats = stats.as_ref();
         let (additions, deletions) =
             stats.map_or((0, 0), |s| (s.additions.max(0), s.deletions.max(0)));
         let changes = additions > 0 || deletions > 0;

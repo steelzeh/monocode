@@ -11,11 +11,18 @@ mod mobile;
 mod monos;
 mod providers;
 mod skills;
+mod tweaks;
+#[cfg(test)]
+pub(in crate::settings) use tweaks::{
+    adds_labels as tweak_adds_labels, meta_line as tweak_meta_line,
+    replace_note as tweak_replace_note,
+};
 mod worktrees;
 
 pub(super) use appearance::parse_hex;
 pub(crate) use appearance::{ACCENTS, swatch};
 pub(super) use connections::ConnectionsState;
+pub(super) use tweaks::TweakInstall;
 pub(crate) use keybindings::command_shortcut;
 pub(super) use mobile::MobileState;
 
@@ -43,6 +50,7 @@ impl SettingsView {
             Section::Inbox => self.inbox_page(cx),
             Section::Archive => self.archive_page(cx),
             Section::Worktrees => self.worktrees_page(cx),
+            Section::Tweaks => self.tweaks_page(cx),
         }
     }
 }

@@ -17,7 +17,7 @@ use gpui::{
     SharedString, Subscription, Task, Window, div, prelude::*, px, rgb,
 };
 use monocode_core::{
-    diff,
+    checkpoint, diff,
     scm::{self, ChangedFile, FileDiff, FileDiffVersion},
 };
 use serde::{Deserialize, Serialize};
@@ -60,6 +60,12 @@ pub(crate) enum ReviewTab {
         session: i64,
         path: Option<String>,
     },
+    /// Every chat's pending agent work in one project, as whole files, to keep
+    /// or undo change by change.
+    Agent {
+        cwd: String,
+        path: Option<String>,
+    },
 }
 impl ReviewTab {
     /// SurfaceTabs's `surfaceTabPresentation`.
@@ -91,6 +97,7 @@ impl ReviewTab {
                 }
             }
             Self::Session { .. } => "Session Changes".into(),
+            Self::Agent { .. } => "Agent Changes".into(),
         }
     }
     /// `editorTabKey`: one Changes tab per checkout and side, one per commit.
@@ -120,6 +127,7 @@ impl ReviewTab {
                     cwd: b, session: y, ..
                 },
             ) => a == b && x == y,
+            (Self::Agent { cwd: a, .. }, Self::Agent { cwd: b, .. }) => a == b,
             _ => false,
         }
     }
@@ -143,6 +151,8 @@ pub(crate) enum ReviewEvent {
     /// The last tab closed.
     Empty,
     WordWrap(bool),
+    /// Agent work was kept or undone: unread counts are stale.
+    AgentChanges,
 }
 
 #[derive(Clone)]
@@ -260,6 +270,7 @@ impl ReviewCache {
 }
 
 pub(crate) struct ReviewPane {
+    workspace_changes: Option<Subscription>,
     git: Entity<ProjectGit>,
     focus: FocusHandle,
     /// Bodies replaced before the next paint may still own keyboard focus.
@@ -274,6 +285,9 @@ pub(crate) struct ReviewPane {
     /// The deferred body fades from its first rendered frame.
     revealed: Option<PaneReveal>,
     hovered_tab: Option<usize>,
+    /// The chat's project, and its files with unread agent work.
+    agent_project: String,
+    agent_files: Vec<checkpoint::ProjectFile>,
     pub(crate) pane_draggable: bool,
     tab_scroll: ScrollHandle,
     /// Tab animations: opening and closing file tabs, with each tab's last look.
@@ -347,12 +361,47 @@ fn session_files(cwd: &str, session: i64) -> Result<Listed, String> {
         None,
     ))
 }
+/// Every chat's pending agent work in the project, listed like a commit.
+fn agent_files(cwd: &str) -> Result<Listed, String> {
+    let store = monocode_core::checkpoint::store().ok_or("Agent changes are unavailable")?;
+    let files = store.exclusive(|s| s.project_status(cwd))?;
+    Ok((
+        files
+            .into_iter()
+            .map(|f| ChangedFile {
+                path: f.path,
+                relative: f.relative,
+                status: f.status,
+                additions: f.additions,
+                deletions: f.deletions,
+                staged: false,
+                unstaged: true,
+            })
+            .collect(),
+        None,
+    ))
+}
+fn agent_file_diff(cwd: &str, relative: &str) -> Result<FileDiff, String> {
+    let store = monocode_core::checkpoint::store().ok_or("Agent changes are unavailable")?;
+    store.exclusive(|s| s.project_file_diff(cwd, relative))
+}
 fn session_file_diff(cwd: &str, session: i64, relative: &str) -> Result<FileDiff, String> {
     let store = monocode_core::checkpoint::store().ok_or("Session changes are unavailable")?;
     store.exclusive(|s| s.file_diff(&session.to_string(), cwd, relative))
 }
 
 impl ReviewPane {
+    /// Keeps diffs of a workspace's other repos current as well.
+    pub(crate) fn follow_workspace(
+        &mut self,
+        folders: &Entity<crate::workspace_folders::WorkspaceFolders>,
+        cx: &mut Context<Self>,
+    ) {
+        self.workspace_changes = Some(cx.subscribe(
+            folders,
+            |this, _, _: &crate::workspace_folders::WorkspaceRepoChanged, cx| this.refresh(cx),
+        ));
+    }
     pub(crate) fn new(git: Entity<ProjectGit>, state: ReviewState, cx: &mut Context<Self>) -> Self {
         let subscriptions = vec![
             cx.subscribe(&git, |this, _, _: &GitChanged, cx| {
@@ -379,6 +428,7 @@ impl ReviewPane {
             }),
         ];
         let mut this = Self {
+            workspace_changes: None,
             git,
             focus: cx.focus_handle(),
             retiring_focus: Vec::new(),
@@ -393,6 +443,8 @@ impl ReviewPane {
             deferred: false,
             revealed: None,
             hovered_tab: None,
+            agent_project: String::new(),
+            agent_files: Vec::new(),
             pane_draggable: false,
             tab_scroll: ScrollHandle::new(),
             tab_motion: Default::default(),
@@ -508,6 +560,19 @@ impl ReviewPane {
                     ReviewTab::Changes { staged: b, .. }
                 ) if a == b
             ) && matches!(tab, ReviewTab::Changes { .. } | ReviewTab::Session { .. });
+            // Opening the tab again without a file keeps the file on screen.
+            let tab = match (&self.sources[ix].tab, tab) {
+                (
+                    ReviewTab::Agent {
+                        path: Some(old), ..
+                    },
+                    ReviewTab::Agent { cwd, path: None },
+                ) => ReviewTab::Agent {
+                    cwd,
+                    path: Some(old.clone()),
+                },
+                (_, tab) => tab,
+            };
             self.sources[ix].tab = tab;
             if reload {
                 self.sources[ix].cancel();
@@ -523,8 +588,133 @@ impl ReviewPane {
         self.state.chat_hidden = self.state.chat_hidden && !self.sources.is_empty();
         self.sync_state();
         self.load_active(cx);
+        if matches!(
+            self.sources.get(self.state.active).map(|s| &s.tab),
+            Some(ReviewTab::Agent { .. })
+        ) {
+            self.publish(cx);
+        }
         cx.emit(ReviewEvent::Changed);
         cx.notify();
+    }
+    /// The chat's project and its changed files, for the bar on every tab.
+    pub(crate) fn set_agent_files(
+        &mut self,
+        project: String,
+        files: Vec<checkpoint::ProjectFile>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.agent_project != project || self.agent_files != files {
+            self.agent_project = project;
+            self.agent_files = files;
+            cx.notify();
+        }
+    }
+    fn open_agent_file(&mut self, path: String, cx: &mut Context<Self>) {
+        self.open(
+            ReviewTab::Agent {
+                cwd: self.agent_project.clone(),
+                path: Some(path),
+            },
+            cx,
+        );
+    }
+    /// Agent Changes draws its own bar. Every other tab gets this short one,
+    /// so changed files are never out of reach.
+    fn agent_bar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let source = self.sources.get(self.state.active)?;
+        if self.deferred
+            || self.agent_files.is_empty()
+            || matches!(source.tab, ReviewTab::Agent { .. })
+        {
+            return None;
+        }
+        let open = match &source.tab {
+            ReviewTab::File { path, .. } => Some(path.as_str()),
+            ReviewTab::Changes { path, .. } => path.as_deref(),
+            _ => None,
+        };
+        let paths: Vec<&str> = self.agent_files.iter().map(|f| f.path.as_str()).collect();
+        let stops = crate::review_bar::bar_stops(open, &paths);
+        let count = paths.len();
+        let noun = if count == 1 { "file" } else { "files" };
+        let label = match stops.position {
+            Some(at) => format!("{} / {count} {noun}", at + 1),
+            None => format!("{count} {noun} changed"),
+        };
+        let path_at = |index: Option<usize>| index.map(|at| self.agent_files[at].path.clone());
+        let (previous, next) = (path_at(stops.previous), path_at(stops.next));
+        let review = path_at(stops.position);
+        let arrow =
+            |id: &'static str, label, glyph, target: Option<String>, cx: &mut Context<Self>| {
+                crate::diff_view::tool_button(id, label, glyph, target.is_some()).when_some(
+                    target,
+                    |d, path| {
+                        d.on_click(
+                            cx.listener(move |this, _, _, cx| {
+                                this.open_agent_file(path.clone(), cx)
+                            }),
+                        )
+                    },
+                )
+            };
+        Some(
+            crate::review_bar::overlay("agent-changes-bar")
+                .child(
+                    crate::review_bar::surface()
+                        .child(arrow(
+                            "agent-bar-previous",
+                            "Previous changed file",
+                            "chevron-left",
+                            previous,
+                            cx,
+                        ))
+                        .child(div().px_1().child(label))
+                        .child(arrow(
+                            "agent-bar-next",
+                            "Next changed file",
+                            "chevron-right",
+                            next,
+                            cx,
+                        ))
+                        .when_some(review, |d, path| {
+                            d.child(
+                                crate::review_bar::pill("agent-bar-review", "Review", true, true)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.open_agent_file(path.clone(), cx)
+                                    })),
+                            )
+                        }),
+                )
+                .into_any_element(),
+        )
+    }
+    /// Show the reviewed file `delta` places along. The list and what loads
+    /// around the new file are refreshed behind it.
+    fn agent_step(&mut self, ix: usize, delta: isize, cx: &mut Context<Self>) {
+        let Some(source) = self.sources.get_mut(ix) else {
+            return;
+        };
+        let (ReviewTab::Agent { path, .. }, Some(files)) = (&mut source.tab, &source.files) else {
+            return;
+        };
+        if files.is_empty() {
+            return;
+        }
+        let at = agent_index(files, path.as_deref());
+        let next = (at as isize + delta).clamp(0, files.len() as isize - 1) as usize;
+        if next == at {
+            return;
+        }
+        *path = Some(files[next].path.clone());
+        source.view.update(cx, |view, cx| {
+            view.review_error = None;
+            cx.notify();
+        });
+        self.sync_state();
+        cx.emit(ReviewEvent::Changed);
+        self.publish(cx);
+        self.load_active(cx);
     }
     /// Single-clicked search matches reuse a clean preview; explicit opens pin it.
     pub(crate) fn open_file(&mut self, tab: ReviewTab, pin: bool, cx: &mut Context<Self>) {
@@ -918,13 +1108,23 @@ impl ReviewPane {
                 .update(cx, |git, _| git.review_cache.remember(source));
         }
     }
+    /// Reread Agent Changes while an agent is working.
+    pub(crate) fn refresh_agent(&mut self, cx: &mut Context<Self>) {
+        if self
+            .sources
+            .get(self.state.active)
+            .is_some_and(|source| matches!(source.tab, ReviewTab::Agent { .. }))
+        {
+            self.refresh(cx);
+        }
+    }
     /// Focus and Git changes reread the working tree; commits never change.
     pub(crate) fn refresh(&mut self, cx: &mut Context<Self>) {
         if self.visible
             && let Some(source) = self.sources.get(self.state.active)
             && matches!(
                 source.tab,
-                ReviewTab::Changes { .. } | ReviewTab::Session { .. }
+                ReviewTab::Changes { .. } | ReviewTab::Session { .. } | ReviewTab::Agent { .. }
             )
         {
             self.load_active(cx);
@@ -987,6 +1187,7 @@ impl ReviewPane {
                         scm::commit_files(&PathBuf::from(cwd), sha).map(|files| (files, None))
                     }
                     ReviewTab::Session { cwd, session, .. } => session_files(cwd, *session),
+                    ReviewTab::Agent { cwd, .. } => agent_files(cwd),
                 }
             }
         });
@@ -1003,6 +1204,15 @@ impl ReviewPane {
                 match listed {
                     Ok((files, versions)) => {
                         source.error = None;
+                        // A file that was kept or undone leaves the list, and
+                        // the file that took its place opens.
+                        let mut moved = false;
+                        if let ReviewTab::Agent { path, .. } = &mut source.tab {
+                            let next =
+                                next_agent_path(source.files.as_deref(), &files, path.as_deref());
+                            moved = *path != next;
+                            *path = next;
+                        }
                         let order: Vec<(String, Option<bool>, ChangedFile)> = match &tab {
                             ReviewTab::File { .. } => unreachable!(),
                             ReviewTab::Changes { path, staged, .. } => {
@@ -1025,6 +1235,17 @@ impl ReviewPane {
                                 .iter()
                                 .map(|f| (f.relative.clone(), None, f.clone()))
                                 .collect(),
+                            // One file at a time: only it and its neighbors load.
+                            ReviewTab::Agent { .. } => {
+                                let current = match &source.tab {
+                                    ReviewTab::Agent { path, .. } => path.as_deref(),
+                                    _ => None,
+                                };
+                                agent_window(&files, current)
+                                    .into_iter()
+                                    .map(|f| (f.relative.clone(), None, f.clone()))
+                                    .collect()
+                            }
                             ReviewTab::Session { path, .. } => {
                                 let mut entries: Vec<_> = files
                                     .iter()
@@ -1044,6 +1265,10 @@ impl ReviewPane {
                             order.iter().map(|e| e.0.clone()).collect();
                         source.loaded.retain(|id, _| retained.contains(id));
                         source.files = Some(files);
+                        if moved {
+                            this.sync_state();
+                            cx.emit(ReviewEvent::Changed);
+                        }
                         this.publish(cx);
                         Some((order, versions))
                     }
@@ -1114,6 +1339,13 @@ impl ReviewPane {
                                     ReviewTab::Session { cwd, session, .. } => {
                                         session_file_diff(cwd, *session, &relative)
                                     }
+                                    ReviewTab::Agent { cwd, .. } => agent_file_diff(cwd, &relative),
+                                };
+                                // A review reads whole files, not hunks with context.
+                                let context = if matches!(tab, ReviewTab::Agent { .. }) {
+                                    usize::MAX
+                                } else {
+                                    diff::CONTEXT_DEFAULT
                                 };
                                 if work_counter.load(Ordering::SeqCst) != generation {
                                     return None;
@@ -1137,7 +1369,7 @@ impl ReviewPane {
                                                 diff::build_unified_file(
                                                     &diff.original,
                                                     &diff.current,
-                                                    diff::CONTEXT_DEFAULT,
+                                                    context,
                                                 )
                                             });
                                         Some(Arc::new(Loaded {
@@ -1284,49 +1516,57 @@ impl ReviewPane {
                         can_discard: !kind,
                         can_stage_hunk: !kind
                             && !loaded.is_some_and(|l| l.diff.binary || l.diff.too_large),
+                        review: false,
                     }
                 })
                 .collect(),
-            ReviewTab::Commit { .. } | ReviewTab::Session { .. } => files
-                .iter()
-                .map(|file| {
-                    let loaded = source.loaded.get(&file.relative);
-                    let unified = loaded.and_then(|l| l.unified.clone());
-                    DiffFile {
-                        id: file.relative.clone().into(),
-                        path: file.path.clone(),
-                        label: file.relative.clone(),
-                        binary: loaded.is_some_and(|l| l.diff.binary),
-                        too_large: loaded.is_some_and(|l| l.diff.too_large),
-                        empty_message: match loaded {
-                            None => Some("Loading…".into()),
-                            Some(l) if l.error.is_some() => Some(format!(
-                                "Couldn’t load diff: {}",
-                                l.error.clone().unwrap_or_default()
-                            )),
-                            Some(l)
-                                if l.unified.is_some()
-                                    && l.additions == 0
-                                    && l.deletions == 0
-                                    && !l.diff.binary =>
-                            {
-                                Some("No textual diff".into())
-                            }
-                            _ => None,
-                        },
-                        additions: loaded
-                            .filter(|l| l.unified.is_some())
-                            .map_or(file.additions as u32, |l| l.additions),
-                        deletions: loaded
-                            .filter(|l| l.unified.is_some())
-                            .map_or(file.deletions as u32, |l| l.deletions),
-                        blocks: unified.unwrap_or_else(|| Arc::new(Vec::new())),
-                        can_stage: false,
-                        can_discard: false,
-                        can_stage_hunk: false,
-                    }
-                })
-                .collect(),
+            ReviewTab::Commit { .. } | ReviewTab::Session { .. } | ReviewTab::Agent { .. } => {
+                shown_files(&source.tab, files)
+                    .iter()
+                    .map(|file| {
+                        let loaded = source.loaded.get(&file.relative);
+                        let unified = loaded.and_then(|l| l.unified.clone());
+                        DiffFile {
+                            id: file.relative.clone().into(),
+                            path: file.path.clone(),
+                            label: file.relative.clone(),
+                            binary: loaded.is_some_and(|l| l.diff.binary),
+                            too_large: loaded.is_some_and(|l| l.diff.too_large),
+                            empty_message: match loaded {
+                                None => Some("Loading…".into()),
+                                Some(l) if l.error.is_some() => Some(format!(
+                                    "Couldn’t load diff: {}",
+                                    l.error.clone().unwrap_or_default()
+                                )),
+                                Some(l)
+                                    if l.unified.is_some()
+                                        && l.additions == 0
+                                        && l.deletions == 0
+                                        && !l.diff.binary =>
+                                {
+                                    Some("No textual diff".into())
+                                }
+                                _ => None,
+                            },
+                            additions: loaded
+                                .filter(|l| l.unified.is_some())
+                                .map_or(file.additions as u32, |l| l.additions),
+                            deletions: loaded
+                                .filter(|l| l.unified.is_some())
+                                .map_or(file.deletions as u32, |l| l.deletions),
+                            blocks: unified.unwrap_or_else(|| Arc::new(Vec::new())),
+                            can_stage: false,
+                            can_discard: false,
+                            can_stage_hunk: false,
+                            // Text a review can change line by line.
+                            review: matches!(source.tab, ReviewTab::Agent { .. })
+                                && loaded.is_some_and(|l| {
+                                    l.error.is_none() && !l.diff.binary && !l.diff.too_large
+                                }),
+                        }
+                    })
+                    .collect()
+            }
         };
         let totals = models
             .iter()
@@ -1349,7 +1589,7 @@ impl ReviewPane {
                 },
             ),
             ReviewTab::Commit { .. } => (None, models.len()),
-            ReviewTab::Session { path, .. } => (
+            ReviewTab::Session { path, .. } | ReviewTab::Agent { path, .. } => (
                 path.as_ref().and_then(|p| {
                     files
                         .iter()
@@ -1359,7 +1599,18 @@ impl ReviewPane {
                 models.len(),
             ),
         };
+        let nav = match &source.tab {
+            ReviewTab::Agent { path, .. } if !files.is_empty() => {
+                Some(crate::diff_view::ReviewNav {
+                    file: agent_index(files, path.as_deref()),
+                    files: files.len(),
+                })
+            }
+            _ => None,
+        };
         source.view.update(cx, |view, cx| {
+            view.review_nav = nav;
+            cx.notify();
             view.totals = Some(totals);
             view.file_count = Some(file_count);
             view.set_files(models, cx);
@@ -1373,6 +1624,11 @@ impl ReviewPane {
             return;
         }
         let source = &self.sources[ix];
+        if let ReviewTab::Agent { cwd, .. } = &source.tab {
+            let cwd = cwd.clone();
+            self.agent_event(ix, cwd, event, cx);
+            return;
+        }
         let ReviewTab::Changes { cwd, .. } = &source.tab else {
             if let DiffEvent::Comment(text) = event {
                 cx.emit(ReviewEvent::Comment(text.clone()));
@@ -1402,6 +1658,11 @@ impl ReviewPane {
                     }),
                 )
             }
+            DiffEvent::KeepHunk(..)
+            | DiffEvent::UndoHunk(..)
+            | DiffEvent::KeepFile(_)
+            | DiffEvent::UndoFile(_)
+            | DiffEvent::StepFile(_) => return,
             DiffEvent::StageHunk(id, chunk) => {
                 let Some(relative) = id.strip_prefix("unstaged:").map(str::to_owned) else {
                     return;
@@ -1438,6 +1699,100 @@ impl ReviewPane {
                 if let Err(error) = result {
                     log_error(&error);
                 }
+            });
+        })
+        .detach();
+    }
+
+    /// Keep or undo agent work. Each undo writes a file only while it still
+    /// holds the text this review showed, so newer edits are never lost.
+    fn agent_event(&mut self, ix: usize, cwd: String, event: &DiffEvent, cx: &mut Context<Self>) {
+        if let DiffEvent::StepFile(delta) = event {
+            self.agent_step(ix, *delta, cx);
+            return;
+        }
+        type Work = Box<dyn FnOnce(&checkpoint::Store) -> Result<(), String> + Send>;
+        let source = &self.sources[ix];
+        let shown = |id: &str| {
+            source
+                .loaded
+                .get(id)
+                .filter(|l| l.error.is_none())
+                .map(|l| l.diff.clone())
+        };
+        let (busy, work): (SharedString, Work) = match event {
+            DiffEvent::Comment(text) => {
+                cx.emit(ReviewEvent::Comment(text.clone()));
+                return;
+            }
+            DiffEvent::KeepHunk(id, chunk) | DiffEvent::UndoHunk(id, chunk) => {
+                let Some(diff) = shown(id) else { return };
+                let keep = matches!(event, DiffEvent::KeepHunk(..));
+                let chunk = *chunk;
+                (
+                    id.clone(),
+                    Box::new(move |store| {
+                        let relative = &diff.relative;
+                        match change_step(&diff, chunk, keep)? {
+                            ChangeStep::KeepFile => store.project_keep(&cwd, Some(relative)),
+                            ChangeStep::UndoFile => {
+                                store.project_undo(&cwd, relative, &diff.current)
+                            }
+                            ChangeStep::KeepPart(baseline) => {
+                                store.project_keep_part(&cwd, relative, &baseline)
+                            }
+                            ChangeStep::Write(next) => {
+                                store.project_write(&cwd, relative, &diff.current, Some(&next))
+                            }
+                        }
+                    }),
+                )
+            }
+            DiffEvent::KeepFile(id) => {
+                let relative = id.to_string();
+                (
+                    id.clone(),
+                    Box::new(move |store| store.project_keep(&cwd, Some(&relative))),
+                )
+            }
+            DiffEvent::UndoFile(id) => {
+                let Some(diff) = shown(id) else { return };
+                (
+                    id.clone(),
+                    Box::new(move |store| store.project_undo(&cwd, &diff.relative, &diff.current)),
+                )
+            }
+            DiffEvent::StepFile(_)
+            | DiffEvent::StageFile(_)
+            | DiffEvent::DiscardFile(_)
+            | DiffEvent::StageHunk(..) => {
+                return;
+            }
+        };
+        let view = source.view.clone();
+        view.update(cx, |v, cx| {
+            v.busy_id = Some(busy);
+            v.review_error = None;
+            cx.notify();
+        });
+        let task = cx.background_executor().spawn(async move {
+            let store = checkpoint::store().ok_or("Agent changes are unavailable")?;
+            store.exclusive(work)
+        });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |this, cx| {
+                view.update(cx, |v, cx| {
+                    v.busy_id = None;
+                    v.review_error = result.as_ref().err().map(|e| e.clone().into());
+                    cx.notify();
+                });
+                if let Err(error) = &result {
+                    log_error(error);
+                }
+                this.load_active(cx);
+                this.git.update(cx, |git, cx| git.changed(cx));
+                cx.emit(ReviewEvent::AgentChanges);
             });
         })
         .detach();
@@ -1745,6 +2100,85 @@ impl ReviewPane {
     }
 }
 
+/// Agent Changes shows one file: the tab's, or the first.
+fn agent_index(files: &[ChangedFile], path: Option<&str>) -> usize {
+    files
+        .iter()
+        .position(|file| Some(file.path.as_str()) == path)
+        .unwrap_or(0)
+}
+fn shown_files<'a>(tab: &ReviewTab, files: &'a [ChangedFile]) -> &'a [ChangedFile] {
+    match tab {
+        ReviewTab::Agent { path, .. } if !files.is_empty() => {
+            std::slice::from_ref(&files[agent_index(files, path.as_deref())])
+        }
+        _ => files,
+    }
+}
+/// The file to show after the list changed: the same one, or the one now in
+/// its place, or the last when it was the last.
+fn next_agent_path(
+    old: Option<&[ChangedFile]>,
+    new: &[ChangedFile],
+    path: Option<&str>,
+) -> Option<String> {
+    if let Some(file) = new.iter().find(|file| Some(file.path.as_str()) == path) {
+        return Some(file.path.clone());
+    }
+    let at = old
+        .and_then(|old| old.iter().position(|file| Some(file.path.as_str()) == path))
+        .unwrap_or(0);
+    new.get(at.min(new.len().saturating_sub(1)))
+        .map(|file| file.path.clone())
+}
+/// What loads: the file on screen and its neighbors, so arrows feel instant.
+fn agent_window<'a>(files: &'a [ChangedFile], path: Option<&str>) -> Vec<&'a ChangedFile> {
+    let at = agent_index(files, path);
+    [Some(at), at.checked_add(1), at.checked_sub(1)]
+        .into_iter()
+        .flatten()
+        .filter_map(|index| files.get(index))
+        .collect()
+}
+
+/// What keeping or undoing one change of a reviewed file does.
+#[derive(Debug, PartialEq)]
+enum ChangeStep {
+    KeepFile,
+    UndoFile,
+    /// The reviewed baseline with this change applied.
+    KeepPart(String),
+    /// The file with this change taken out.
+    Write(String),
+}
+fn change_step(diff: &FileDiff, chunk: usize, keep: bool) -> Result<ChangeStep, String> {
+    // A deleted file is one change: it goes, or comes back whole.
+    if diff.status == "deleted" {
+        return Ok(if keep {
+            ChangeStep::KeepFile
+        } else {
+            ChangeStep::UndoFile
+        });
+    }
+    let gone = || "This change is no longer in the file".to_string();
+    if keep {
+        let baseline = diff::stage_chunk(&diff.original, &diff.current, chunk).ok_or_else(gone)?;
+        // Keeping the last change keeps the file.
+        return Ok(if baseline == diff.current {
+            ChangeStep::KeepFile
+        } else {
+            ChangeStep::KeepPart(baseline)
+        });
+    }
+    let next = diff::revert_chunk(&diff.original, &diff.current, chunk).ok_or_else(gone)?;
+    // Undoing all of a new file removes it, rather than leaving it empty.
+    Ok(if next == diff.original {
+        ChangeStep::UndoFile
+    } else {
+        ChangeStep::Write(next)
+    })
+}
+
 fn log_error(error: &str) {
     eprintln!("monocode: review action failed: {error}");
 }
@@ -1803,7 +2237,8 @@ impl Render for ReviewPane {
                     ReviewTab::File { cwd, .. }
                     | ReviewTab::Changes { cwd, .. }
                     | ReviewTab::Commit { cwd, .. }
-                    | ReviewTab::Session { cwd, .. } => cwd,
+                    | ReviewTab::Session { cwd, .. }
+                    | ReviewTab::Agent { cwd, .. } => cwd,
                 };
                 if cwd.is_empty() || cwd == "~" {
                     centered()
@@ -1820,9 +2255,9 @@ impl Render for ReviewPane {
                         .child(div().text_size(px(13.)).text_color(content(1.)).child(
                             match source.tab {
                                 ReviewTab::File { .. } => "Couldn’t open file",
-                                ReviewTab::Changes { .. } | ReviewTab::Session { .. } => {
-                                    "Couldn’t load changes"
-                                }
+                                ReviewTab::Changes { .. }
+                                | ReviewTab::Session { .. }
+                                | ReviewTab::Agent { .. } => "Couldn’t load changes",
                                 ReviewTab::Commit { .. } => "Couldn’t load commit",
                             },
                         ))
@@ -1846,6 +2281,7 @@ impl Render for ReviewPane {
                 }
             }
         };
+        let agent_bar = self.agent_bar(cx);
         let menu = self
             .menu
             .as_ref()
@@ -1878,7 +2314,8 @@ impl Render for ReviewPane {
                     .flex_1()
                     .min_h_0()
                     .opacity(fade)
-                    .child(body),
+                    .child(body)
+                    .children(agent_bar),
             )
             .children(menu)
     }
@@ -2316,5 +2753,204 @@ mod tests {
             path: Some("a".into()),
             staged: None
         }));
+    }
+
+    #[gpui::test]
+    fn the_pane_steps_one_file_at_a_time_and_every_other_tab_gets_the_short_bar(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let repo = Repo::new();
+        let cwd = repo.cwd();
+        let git = cx.new(|cx| ProjectGit::new(cwd.clone(), cx));
+        let pane = cx.new(|cx| ReviewPane::new(git, Default::default(), cx));
+        let names = ["a", "b", "c"];
+        let shown = |pane: &ReviewPane, cx: &gpui::App| {
+            let view = pane.sources[pane.state.active].view.read(cx);
+            (view.shown_ids(), view.review_nav.map(|n| (n.file, n.files)))
+        };
+        pane.update(cx, |pane, cx| {
+            // Deferred, so no file reads run and the list below stays as set.
+            pane.set_deferred(true, cx);
+            pane.open(
+                ReviewTab::Agent {
+                    cwd: cwd.clone(),
+                    path: None,
+                },
+                cx,
+            );
+            pane.sources[0].files = Some(names.iter().map(|n| file(n, false, true)).collect());
+            pane.publish(cx);
+            // No file chosen yet: the first shows, with the bar's position.
+            assert_eq!(shown(pane, cx), (vec!["a".to_string()], Some((0, 3))));
+            pane.agent_step(0, 1, cx);
+            assert_eq!(shown(pane, cx), (vec!["b".to_string()], Some((1, 3))));
+            pane.agent_step(0, 5, cx);
+            assert_eq!(shown(pane, cx), (vec!["c".to_string()], Some((2, 3))));
+            // The sidebar number opens the tab without a file: you stay put.
+            pane.open(
+                ReviewTab::Agent {
+                    cwd: cwd.clone(),
+                    path: None,
+                },
+                cx,
+            );
+            assert_eq!(shown(pane, cx), (vec!["c".to_string()], Some((2, 3))));
+            // An arrow on another tab names the file to open.
+            pane.open(
+                ReviewTab::Agent {
+                    cwd: cwd.clone(),
+                    path: Some("/r/a".into()),
+                },
+                cx,
+            );
+            assert_eq!(shown(pane, cx), (vec!["a".to_string()], Some((0, 3))));
+            assert_eq!(pane.sources.len(), 1, "one Agent Changes tab per project");
+
+            // The short bar: never on Agent Changes, and only with changed files.
+            pane.set_deferred(false, cx);
+            pane.sources[0].files = Some(names.iter().map(|n| file(n, false, true)).collect());
+            let project = |n: &str| checkpoint::ProjectFile {
+                path: format!("/r/{n}"),
+                relative: n.into(),
+                status: "modified".into(),
+                additions: 1,
+                deletions: 0,
+                sessions: Vec::new(),
+            };
+            pane.set_agent_files(cwd.clone(), vec![project("a"), project("b")], cx);
+            assert!(pane.agent_bar(cx).is_none());
+            pane.open(
+                ReviewTab::File {
+                    cwd: cwd.clone(),
+                    path: repo.0.join("a.txt").to_string_lossy().into_owned(),
+                },
+                cx,
+            );
+            assert!(pane.agent_bar(cx).is_some(), "shows on the wrong file");
+            pane.set_agent_files(cwd.clone(), Vec::new(), cx);
+            assert!(pane.agent_bar(cx).is_none());
+        });
+    }
+
+    #[test]
+    fn agent_changes_shows_one_file_and_moves_on_when_it_is_settled() {
+        let list = |names: &[&str]| -> Vec<ChangedFile> {
+            names.iter().map(|n| file(n, false, true)).collect()
+        };
+        let all = list(&["a", "b", "c"]);
+        let path = |at: usize| all[at].path.clone();
+        let tab = |at: Option<usize>| ReviewTab::Agent {
+            cwd: "/p".into(),
+            path: at.map(path),
+        };
+        // Only the chosen file is shown, or the first.
+        assert_eq!(shown_files(&tab(Some(1)), &all)[0].relative, "b");
+        assert_eq!(shown_files(&tab(Some(1)), &all).len(), 1);
+        assert_eq!(shown_files(&tab(None), &all)[0].relative, "a");
+        assert!(shown_files(&tab(None), &[]).is_empty());
+        // Other tabs still show everything.
+        let changes = ReviewTab::Commit {
+            cwd: "/p".into(),
+            sha: "s".into(),
+            short_sha: "s".into(),
+            subject: "s".into(),
+        };
+        assert_eq!(shown_files(&changes, &all).len(), 3);
+        // A new file elsewhere in the list never moves you.
+        let more = list(&["0", "a", "b", "c"]);
+        assert_eq!(
+            next_agent_path(Some(&all), &more, Some(&path(1))),
+            Some(path(1))
+        );
+        // Settled: the file now in its place opens.
+        let without_b = list(&["a", "c"]);
+        assert_eq!(
+            next_agent_path(Some(&all), &without_b, Some(&path(1))),
+            Some(path(2))
+        );
+        // Settled the last one: the one before it opens.
+        let without_c = list(&["a", "b"]);
+        assert_eq!(
+            next_agent_path(Some(&all), &without_c, Some(&path(2))),
+            Some(path(1))
+        );
+        assert_eq!(next_agent_path(Some(&all), &[], Some(&path(1))), None);
+        assert_eq!(next_agent_path(None, &all, None), Some(path(0)));
+        // Only the file on screen and its neighbors load.
+        let loaded = |at: usize| -> Vec<String> {
+            agent_window(&all, Some(&path(at)))
+                .iter()
+                .map(|f| f.relative.clone())
+                .collect()
+        };
+        assert_eq!(loaded(0), ["a", "b"]);
+        assert_eq!(loaded(1), ["b", "c", "a"]);
+        assert_eq!(loaded(2), ["c", "b"]);
+    }
+
+    fn reviewed(status: &str, original: &str, current: &str) -> FileDiff {
+        FileDiff {
+            path: "/r/a.txt".into(),
+            relative: "a.txt".into(),
+            status: status.into(),
+            original: original.into(),
+            current: current.into(),
+            binary: false,
+            too_large: false,
+        }
+    }
+
+    #[test]
+    fn each_change_is_kept_or_undone_on_its_own_and_the_last_one_settles_the_file() {
+        let two = reviewed(
+            "modified",
+            "1\n2\n3\n4\n5\n6\n7\n8\n",
+            "1\nTWO\n3\n4\n5\n6\n7\nEIGHT\n",
+        );
+        assert_eq!(
+            change_step(&two, 0, true).unwrap(),
+            ChangeStep::KeepPart("1\nTWO\n3\n4\n5\n6\n7\n8\n".into())
+        );
+        assert_eq!(
+            change_step(&two, 1, false).unwrap(),
+            ChangeStep::Write("1\nTWO\n3\n4\n5\n6\n7\n8\n".into())
+        );
+        assert!(change_step(&two, 2, true).is_err());
+        let one = reviewed("modified", "a\n", "b\n");
+        assert_eq!(change_step(&one, 0, true).unwrap(), ChangeStep::KeepFile);
+        assert_eq!(change_step(&one, 0, false).unwrap(), ChangeStep::UndoFile);
+        // A new file's only change: undo removes the file, not just its text.
+        let added = reviewed("added", "", "new\n");
+        assert_eq!(change_step(&added, 0, false).unwrap(), ChangeStep::UndoFile);
+        let deleted = reviewed("deleted", "old\n", "");
+        assert_eq!(
+            change_step(&deleted, 0, true).unwrap(),
+            ChangeStep::KeepFile
+        );
+        assert_eq!(
+            change_step(&deleted, 0, false).unwrap(),
+            ChangeStep::UndoFile
+        );
+    }
+
+    #[test]
+    fn agent_tabs_are_one_per_project_and_named_for_agent_changes() {
+        let a = ReviewTab::Agent {
+            cwd: "/p".into(),
+            path: None,
+        };
+        let b = ReviewTab::Agent {
+            cwd: "/p".into(),
+            path: Some("/p/x".into()),
+        };
+        let c = ReviewTab::Agent {
+            cwd: "/q".into(),
+            path: None,
+        };
+        assert!(a.same_tab(&b));
+        assert!(!a.same_tab(&c));
+        assert_eq!(a.label(), "Agent Changes");
+        let saved = serde_json::to_string(&a).unwrap();
+        assert_eq!(serde_json::from_str::<ReviewTab>(&saved).unwrap(), a);
     }
 }

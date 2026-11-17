@@ -28,6 +28,13 @@ pub(crate) fn tab_icons_width(count: usize) -> f32 {
     count as f32 * 26. + count.saturating_sub(1) as f32 * 2.
 }
 
+/// Each tab's label room when every tab shows its name. A named tab is 6px
+/// wider than its icon and label: its padding grows and the label is inset.
+pub(crate) fn expanded_tab_label_width(width: f32, count: usize) -> f32 {
+    let each = (width - tab_icons_width(count) - 6. * count as f32).max(0.) / count.max(1) as f32;
+    if each < 30. { 0. } else { each }
+}
+
 pub(crate) fn tab_label_width(width: f32, count: usize) -> f32 {
     // The selected tab adds 2px of padding per side. Below 30px there is
     // insufficient room for a useful abbreviated label and its 6px gap.
@@ -59,12 +66,17 @@ pub(crate) fn tabular() -> FontFeatures {
 #[serde(rename_all = "lowercase")]
 pub(crate) enum RightTab {
     #[default]
+    // Layouts saved while the app had a built-in Worktrees tab open as Explorer.
+    #[serde(alias = "worktrees")]
     Files,
     Changes,
     Graph,
     /// The project's terminal, when it opens in the panel. Always last and
     /// never part of the saved order.
     Terminal,
+    /// Panels from the user's tweaks, shown only while one is enabled. Never
+    /// part of the saved order.
+    Tweaks,
 }
 impl RightTab {
     fn label(self) -> &'static str {
@@ -72,6 +84,7 @@ impl RightTab {
             Self::Files => "Explorer",
             Self::Changes => "Changes",
             Self::Graph => "History",
+            Self::Tweaks => "Tweaks",
             Self::Terminal => "Terminal",
         }
     }
@@ -80,7 +93,7 @@ impl RightTab {
     pub(crate) fn normalize(order: &[RightTab]) -> Vec<RightTab> {
         let mut out = Vec::new();
         for tab in order.iter().chain(&[Self::Files, Self::Graph]) {
-            if !matches!(tab, Self::Terminal | Self::Changes) && !out.contains(tab) {
+            if !matches!(tab, Self::Terminal | Self::Changes | Self::Tweaks) && !out.contains(tab) {
                 out.push(*tab);
             }
         }
@@ -249,6 +262,7 @@ pub(crate) struct RightPanel {
     pub tabs: Entity<ProjectTabs>,
     pub explorer: Entity<Explorer>,
     pub changes: Entity<Changes>,
+    pub workspace_changes: Entity<crate::workspace_changes::WorkspaceChanges>,
     pub history: Entity<History>,
     focus: FocusHandle,
     tab: RightTab,
@@ -257,10 +271,16 @@ pub(crate) struct RightPanel {
     sidebar_tab: Option<RightTab>,
     /// Whether the Terminal tab follows the others; the shell draws its pane.
     terminal_tab: bool,
+    /// Whether the Tweaks tab shows, and the view the shell made for it.
+    tweak_tab: bool,
+    tweaks: Option<Entity<crate::tweaks::TweakPanel>>,
     /// Classic reserves the title bar's height; rounded content starts at
     /// the card's top edge, below the window-wide title bar.
     top_inset: f32,
     tab_width: f32,
+    /// Every tab shows its name, and Explorer needs no header of its own.
+    expanded_tabs: bool,
+    search_was_open: bool,
     drag: Option<TabDrag>,
     reveal: Option<TabReveal>,
     skip_click: bool,
@@ -277,17 +297,29 @@ impl Focusable for RightPanel {
 impl RightPanel {
     pub(crate) fn new(
         git: Entity<ProjectGit>,
+        folders: Entity<crate::workspace_folders::WorkspaceFolders>,
         tab: RightTab,
         order: Vec<RightTab>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let explorer = cx.new(|cx| Explorer::new(git.clone(), window, cx));
+        let explorer = cx.new(|cx| Explorer::new(git.clone(), folders.clone(), window, cx));
         let changes = cx.new(|cx| Changes::new(git.clone(), window, cx));
+        let workspace_changes =
+            cx.new(|cx| crate::workspace_changes::WorkspaceChanges::new(folders.clone(), cx));
         let history = cx.new(|cx| History::new(git.clone(), window, cx));
         let subscriptions = vec![
             cx.observe(&git, |_, _, cx| cx.notify()),
             cx.subscribe(&git, |_, _, _: &GitChanged, cx| cx.notify()),
+            cx.observe(&workspace_changes, |_, _, cx| cx.notify()),
+            // Escape can close Explorer's search, which relights its tab.
+            cx.observe(&explorer, |this, explorer, cx| {
+                let open = explorer.read(cx).search_open();
+                if this.search_was_open != open {
+                    this.search_was_open = open;
+                    cx.notify();
+                }
+            }),
         ];
         let panel = cx.entity();
         let tabs = cx.new(|cx| ProjectTabs {
@@ -299,6 +331,7 @@ impl RightPanel {
             focus: cx.focus_handle(),
             explorer,
             changes,
+            workspace_changes,
             history,
             tab,
             order: RightTab::normalize(&order),
@@ -307,10 +340,14 @@ impl RightPanel {
             terminal_tab: false,
             top_inset: 0.,
             tab_width: tabs_width(3),
+            expanded_tabs: false,
+            search_was_open: false,
             drag: None,
             reveal: None,
             skip_click: false,
-            tab_bounds: (0..4).map(|_| Default::default()).collect(),
+            tweak_tab: false,
+            tweaks: None,
+            tab_bounds: (0..5).map(|_| Default::default()).collect(),
             _subscriptions: subscriptions,
         }
     }
@@ -324,7 +361,51 @@ impl RightPanel {
         if self.terminal_tab {
             tabs.insert(1.min(tabs.len()), RightTab::Terminal);
         }
+        if self.tweak_tab {
+            tabs.push(RightTab::Tweaks);
+        }
         tabs
+    }
+    /// The tab on screen: the classic sidebar's tool, or the panel's own.
+    pub(crate) fn visible_tab(&self) -> Option<RightTab> {
+        self.sidebar_tab.or(self.shown.then_some(self.tab))
+    }
+    /// Adds or removes the Tweaks tab; Explorer takes over when it goes.
+    pub(crate) fn set_tweak_tab(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        // Also when the flag is unchanged: a restored layout can open on this
+        // tab after its tweak was turned off.
+        if !enabled && self.tab == RightTab::Tweaks {
+            self.select(RightTab::Files, cx);
+        }
+        if self.tweak_tab != enabled {
+            self.tweak_tab = enabled;
+            cx.notify();
+        }
+    }
+    pub(crate) fn tweaks(&self) -> Option<&Entity<crate::tweaks::TweakPanel>> {
+        self.tweaks.as_ref()
+    }
+    pub(crate) fn set_tweaks(
+        &mut self,
+        view: Entity<crate::tweaks::TweakPanel>,
+        cx: &mut Context<Self>,
+    ) {
+        // Choosing another panel renames the tab.
+        self._subscriptions
+            .push(cx.observe(&view, |_, _, cx| cx.notify()));
+        self.tweaks = Some(view);
+        cx.notify();
+    }
+    /// The Tweaks tab shows the icon of the panel it shows.
+    pub(crate) fn tweak_tab_icon(&self, cx: &App) -> &'static str {
+        crate::tweaks::tab_icon(self.tweaks.as_ref(), cx)
+    }
+    /// A tab's name. The Tweaks tab takes the name of the panel it shows.
+    pub(crate) fn tab_title(&self, tab: RightTab, cx: &App) -> SharedString {
+        match tab {
+            RightTab::Tweaks => crate::tweaks::tab_title(self.tweaks.as_ref(), cx),
+            _ => tab.label().into(),
+        }
     }
     /// Adds or removes the Terminal tab; Explorer takes over when it goes.
     pub(crate) fn set_terminal_tab(&mut self, enabled: bool, cx: &mut Context<Self>) {
@@ -347,6 +428,15 @@ impl RightPanel {
     pub(crate) fn set_top_inset(&mut self, height: f32, cx: &mut Context<Self>) {
         if self.top_inset != height {
             self.top_inset = height;
+            cx.notify();
+        }
+    }
+    pub(crate) fn set_expanded_tabs(&mut self, expanded: bool, cx: &mut Context<Self>) {
+        if self.expanded_tabs != expanded {
+            self.expanded_tabs = expanded;
+            self.explorer
+                .update(cx, |explorer, cx| explorer.set_header_hidden(expanded, cx));
+            self.tabs.update(cx, |_, cx| cx.notify());
             cx.notify();
         }
     }
@@ -388,6 +478,9 @@ impl RightPanel {
             e.set_enabled(shown && tab == RightTab::Files, cx)
         });
         self.changes.update(cx, |c, cx| {
+            c.set_enabled(shown && tab == RightTab::Changes, cx)
+        });
+        self.workspace_changes.update(cx, |c, cx| {
             c.set_enabled(shown && tab == RightTab::Changes, cx)
         });
         self.history.update(cx, |h, cx| {
@@ -438,7 +531,10 @@ impl RightPanel {
         let bounds: Vec<Option<Bounds<Pixels>>> = tabs
             .iter()
             .zip(&self.tab_bounds)
-            .map(|(tab, slot)| slot.get().filter(|_| *tab != RightTab::Terminal))
+            .map(|(tab, slot)| {
+                slot.get()
+                    .filter(|_| !matches!(tab, RightTab::Terminal | RightTab::Tweaks))
+            })
             .collect();
         if let Some(Some(own)) = bounds.get(from) {
             let centre = own.center().x + drag.offset;
@@ -500,19 +596,24 @@ impl RightPanel {
             .filter(|d| d.active)
             .map(|d| (d.tab, d.offset));
         let count = self.tabs().len();
+        let expanded = self.expanded_tabs;
+        // Search shows inside Explorer, so its tab is the lit one meanwhile.
+        let searching = expanded && self.explorer.read(cx).search_open();
         let tabs: Vec<AnyElement> = self
             .tabs()
             .into_iter()
             .enumerate()
             .map(|(ix, tab)| {
-                let active = self.tab == tab;
+                let active = self.tab == tab && !(searching && tab == RightTab::Files);
                 let (id, path) = match tab {
                     RightTab::Files => ("right-panel-tab-Explorer", "file-script"),
                     RightTab::Changes => ("right-panel-tab-Changes", "git-branch"),
                     RightTab::Graph => ("right-panel-tab-History", "clock"),
+                    RightTab::Tweaks => ("right-panel-tab-Tweaks", self.tweak_tab_icon(cx)),
                     RightTab::Terminal => ("right-panel-tab-Terminal", "terminal"),
                 };
                 let unfolded = match progress {
+                    _ if expanded => 1.,
                     Some((_, p)) if active => p,
                     Some((closing, p)) if tab == closing => 1. - p,
                     _ if active => 1.,
@@ -530,8 +631,11 @@ impl RightPanel {
                     .child(
                         tab_button(
                             id,
-                            TabLabel::from(tab.label())
-                                .max_width(tab_label_width(self.tab_width, count)),
+                            TabLabel::from(self.tab_title(tab, cx)).max_width(if expanded {
+                                expanded_tab_label_width(self.tab_width, count)
+                            } else {
+                                tab_label_width(self.tab_width, count)
+                            }),
                             path,
                             active,
                             false,
@@ -555,6 +659,12 @@ impl RightPanel {
                                     return;
                                 }
                                 this.select(tab, cx);
+                                if this.expanded_tabs && tab == RightTab::Files {
+                                    this.explorer.update(cx, |explorer, cx| {
+                                        explorer.close_search(window, cx);
+                                    });
+                                    cx.notify();
+                                }
                                 this.focus_pane(window, cx);
                             },
                         )),
@@ -590,8 +700,13 @@ impl RightPanel {
 }
 
 impl Render for RightPanel {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let pane: AnyElement = match self.tab {
+            RightTab::Changes if self.workspace_changes.read(cx).active() => self
+                .workspace_changes
+                .clone()
+                .cached(StyleRefinement::default().flex_1().min_h_0().w_full())
+                .into_any_element(),
             RightTab::Files => self
                 .explorer
                 .clone()
@@ -609,6 +724,10 @@ impl Render for RightPanel {
                 .into_any_element(),
             // The shell paints the terminal over this pane.
             RightTab::Terminal => div().into_any_element(),
+            RightTab::Tweaks => match &self.tweaks {
+                Some(view) => view.clone().into_any_element(),
+                None => div().flex_1().into_any_element(),
+            },
         };
         div()
             .id("right-panel")
@@ -635,6 +754,17 @@ impl Render for RightPanel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_layout_saved_with_the_old_worktrees_tab_opens_as_explorer() {
+        let tab: RightTab = serde_json::from_str("\"worktrees\"").unwrap();
+        assert_eq!(tab, RightTab::Files);
+        let order: Vec<RightTab> =
+            serde_json::from_str(r#"["files","graph","worktrees"]"#).unwrap();
+        assert_eq!(
+            RightTab::normalize(&order),
+            [RightTab::Files, RightTab::Graph]
+        );
+    }
     #[test]
     fn tab_order_keeps_known_tabs_once() {
         assert_eq!(

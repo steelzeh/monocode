@@ -24,6 +24,48 @@ pub(crate) struct Watch {
     _watcher: notify::RecommendedWatcher,
 }
 
+/// Reports the files that change below `root`, for a language server. The
+/// server handles a replaced file only when told about that file by name.
+pub(crate) fn watch_file_names(
+    root: &Path,
+    report: impl Fn(Vec<monocode_core::language_server::FileChange>) + Send + 'static,
+) -> Option<Watch> {
+    let mut watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+        let Ok(event) = event else {
+            return;
+        };
+        let changes = file_changes(&event);
+        if !changes.is_empty() {
+            report(changes);
+        }
+    })
+    .ok()?;
+    watcher.watch(root, RecursiveMode::Recursive).ok()?;
+    Some(Watch { _watcher: watcher })
+}
+
+fn file_changes(event: &notify::Event) -> Vec<monocode_core::language_server::FileChange> {
+    if event.kind.is_access() {
+        return Vec::new();
+    }
+    event
+        .paths
+        .iter()
+        .filter(|path| {
+            !path.components().any(|part| match part {
+                Component::Normal(name) => {
+                    name == ".git" || IGNORED_DIRS.iter().any(|dir| name == *dir)
+                }
+                _ => false,
+            })
+        })
+        .map(|path| monocode_core::language_server::FileChange {
+            path: path.clone(),
+            exists: path.exists(),
+        })
+        .collect()
+}
+
 /// Watches each existing root recursively. The receiver holds at most one
 /// pending signal however many files changed. None if the platform watcher
 /// can't start, so callers fall back to polling.
@@ -125,5 +167,50 @@ mod tests {
             "a burst of edits leaves one pending signal"
         );
         std::fs::remove_dir_all(&root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod file_name_tests {
+    use super::*;
+    use notify::{Event, EventKind, event::CreateKind};
+
+    fn event(paths: &[&Path]) -> Event {
+        let mut event = Event::new(EventKind::Create(CreateKind::File));
+        for path in paths {
+            event = event.add_path(path.to_path_buf());
+        }
+        event
+    }
+
+    #[test]
+    fn changes_name_the_file_and_say_if_it_still_exists() {
+        let dir = tempfile_dir();
+        let present = dir.join("a.ts");
+        std::fs::write(&present, "").unwrap();
+        let gone = dir.join("b.ts");
+        let changes = file_changes(&event(&[&present, &gone]));
+        assert_eq!(changes.len(), 2);
+        assert!(changes[0].exists);
+        assert_eq!(changes[0].path, present);
+        assert!(!changes[1].exists);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn dependency_and_git_folders_are_ignored() {
+        let changes = file_changes(&event(&[
+            Path::new("/r/node_modules/x/a.ts"),
+            Path::new("/r/.git/index"),
+            Path::new("/r/src/a.ts"),
+        ]));
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].path, Path::new("/r/src/a.ts"));
+    }
+
+    fn tempfile_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("monocode-file-names-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
     }
 }

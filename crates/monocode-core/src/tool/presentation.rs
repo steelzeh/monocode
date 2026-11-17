@@ -86,6 +86,22 @@ pub(super) fn present(call: &ToolCall, fallback_cwd: Option<&str>) -> ToolPresen
             steps: Vec::new(),
         };
     }
+    if call.is_fork() {
+        let (from, at) = call.fork_origin().unwrap_or_default();
+        let from: String = from.chars().take(60).collect();
+        return ToolPresentation {
+            action: match crate::response::fork_time(at) {
+                Some(at) => format!("Forked from {from} · {at}"),
+                None => format!("Forked from {from}"),
+            },
+            target: String::new(),
+            file_path: None,
+            start_line: None,
+            command: None,
+            description: None,
+            steps: Vec::new(),
+        };
+    }
     if call.is_handoff() {
         let input = serde_json::from_str::<Value>(&call.input).unwrap_or(Value::Null);
         let from = input["from"].as_str().unwrap_or("the previous model");
@@ -265,6 +281,15 @@ pub(super) fn present(call: &ToolCall, fallback_cwd: Option<&str>) -> ToolPresen
             return shown;
         }
         if let Some(action) = shown.command.as_deref().and_then(app_cli_action) {
+            // A message to another chat names the chat it reached.
+            if let Some(title) = (action == "sessions.send" && call.state == ToolState::Completed)
+                .then(|| crate::chat_links::sent_to(&call.output))
+                .flatten()
+            {
+                shown.action = "Sent message to".into();
+                shown.target = title;
+                return shown;
+            }
             let (action, target) = app_activity(action, call.state == ToolState::Running);
             shown.action = action.into();
             shown.target = target.into();
@@ -874,6 +899,35 @@ mod tests {
         assert_eq!(
             (shown.action.as_str(), shown.target.as_str()),
             ("Remembered", "that")
+        );
+    }
+
+    #[test]
+    fn a_message_to_another_chat_names_that_chat() {
+        let mut sent = call(
+            "Bash",
+            json!({"command":"\"/Applications/Monocode Native.app/Contents/MacOS/monocode-gpui\" app sessions.send --json '{\"sessionId\":34,\"prompt\":\"x\"}'"}),
+        );
+        let shown = sent.presentation();
+        assert_eq!(
+            (shown.action.as_str(), shown.target.as_str()),
+            ("Messaging", "a session")
+        );
+        sent.state = ToolState::Completed;
+        sent.output =
+            r#"{"ok":true,"result":{"sessionId":34,"title":"Run the tests"},"requestId":"a"}"#
+                .into();
+        let shown = sent.presentation();
+        assert_eq!(
+            (shown.action.as_str(), shown.target.as_str()),
+            ("Sent message to", "Run the tests")
+        );
+        // A refused message keeps the general caption.
+        sent.output = r#"{"ok":false,"error":"That chat is not linked"}"#.into();
+        let shown = sent.presentation();
+        assert_eq!(
+            (shown.action.as_str(), shown.target.as_str()),
+            ("Messaged", "a session")
         );
     }
 

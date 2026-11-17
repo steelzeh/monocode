@@ -243,6 +243,10 @@ impl EventEmitter<ChangesEvent> for Changes {}
 
 impl Changes {
     pub(crate) fn new(git: Entity<ProjectGit>, _: &mut Window, cx: &mut Context<Self>) -> Self {
+        Self::detached(git, cx)
+    }
+    /// A view made without a window, for a repo section in a workspace.
+    pub(crate) fn detached(git: Entity<ProjectGit>, cx: &mut Context<Self>) -> Self {
         let message = cx.new(Input::commit_message);
         let subscriptions = vec![
             cx.observe(&git, |this, _, cx| this.index_changed(cx)),
@@ -963,13 +967,202 @@ impl Changes {
         (can_push, can_push && !open_pr && !Self::on_default(index))
     }
 
-    fn header(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// What the file list says instead of rows, when there are none.
+    pub(crate) fn empty_text(&self, cx: &App) -> Option<String> {
+        match self.git.read(cx).index.as_ref() {
+            None => Some("Loading changes…".to_owned()),
+            Some(i) if i.files.is_empty() => Some(if i.ahead > 0 || i.behind > 0 {
+                sync_status_label(i)
+            } else {
+                "No uncommitted changes".into()
+            }),
+            _ => None,
+        }
+    }
+    pub(crate) fn has_files(&self, cx: &App) -> bool {
+        self.git
+            .read(cx)
+            .index
+            .as_ref()
+            .is_some_and(|index| !index.files.is_empty())
+    }
+    pub(crate) fn line_count(&self) -> usize {
+        self.lines.len()
+    }
+    pub(crate) fn line_element(&self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
+        if ix < self.lines.len() {
+            self.line(ix, cx)
+        } else {
+            div().into_any_element()
+        }
+    }
+    pub(crate) fn commit_box_element(&self, cx: &mut Context<Self>) -> AnyElement {
+        self.commit_box(cx).into_any_element()
+    }
+    pub(crate) fn menu_element(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let open = self.menu.as_ref()?;
+        let anchor = match open.kind {
+            MenuKind::Branch => self.branch_anchor.clone(),
+            MenuKind::Commit => self.commit_anchor.clone(),
+        };
+        Some(
+            menu_popover(&open.menu, Anchor::Slot(anchor), cx)
+                .align(Align::End)
+                .into_any_element(),
+        )
+    }
+    /// A repo's row in a workspace: its name and change count, then its branch.
+    pub(crate) fn repo_header(
+        &self,
+        name: String,
+        open: bool,
+        toggle: impl Fn(&mut App) + 'static,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let index = self.git.read(cx).index.clone();
+        let branch = index.as_ref().and_then(|i| i.branch.clone());
+        let count = index.as_ref().map_or(0, |i| i.files.len());
+        let (ahead, behind) = index.as_ref().map_or((0, 0), |i| (i.ahead, i.behind));
+        div()
+            .h(px(32.))
+            .w_full()
+            .flex()
+            .items_center()
+            .gap_2()
+            .pl(px(6.))
+            .pr(px(6.))
+            .border_t_1()
+            .border_color(content(0.06))
+            .child(
+                div()
+                    .id("workspace-repo-toggle")
+                    .role(Role::Button)
+                    .aria_label(SharedString::from(name.clone()))
+                    .aria_expanded(open)
+                    .min_w_0()
+                    .h_full()
+                    .flex_1()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .cursor_pointer()
+                    .on_click(move |_, _, cx| toggle(cx))
+                    .child(
+                        icon(
+                            if open {
+                                "chevron-down"
+                            } else {
+                                "chevron-right"
+                            },
+                            14.,
+                        )
+                        .text_color(content(0.5)),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(px(13.))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(content(1.))
+                            .child(name),
+                    )
+                    .when(count > 0, |d| {
+                        d.child(
+                            div()
+                                .flex_shrink_0()
+                                .ml_1()
+                                .font_features(tabular())
+                                .text_size(px(11.))
+                                .text_color(content(0.45))
+                                .child(count.to_string()),
+                        )
+                    }),
+            )
+            .when_some(self.status.clone(), |d, status| {
+                d.child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(px(11.))
+                        .text_color(content(0.5))
+                        .child(status),
+                )
+            })
+            .when_some(branch.clone(), |d, branch| {
+                d.child(
+                    div()
+                        .min_w_0()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .text_size(px(12.))
+                        .text_color(content(0.55))
+                        .child(icon("git-branch-hi", 12.).text_color(content(0.45)))
+                        .child(div().min_w_0().truncate().child(branch))
+                        .when(ahead > 0, |d| {
+                            d.child(
+                                div()
+                                    .flex_shrink_0()
+                                    .font_features(tabular())
+                                    .text_size(px(11.))
+                                    .child(format!("↑{ahead}")),
+                            )
+                        })
+                        .when(behind > 0, |d| {
+                            d.child(
+                                div()
+                                    .flex_shrink_0()
+                                    .font_features(tabular())
+                                    .text_size(px(11.))
+                                    .child(format!("↓{behind}")),
+                            )
+                        }),
+                )
+            })
+            .when(branch.is_some(), |d| d.child(self.branch_actions(cx)))
+            .into_any_element()
+    }
+    fn branch_actions(&self, cx: &mut Context<Self>) -> AnyElement {
         let busy = self.busy.is_some();
         let menu_open = self
             .menu
             .as_ref()
             .is_some_and(|m| m.kind == MenuKind::Branch);
+        div()
+            .id("branch-actions")
+            .role(Role::Button)
+            .aria_label("Branch actions")
+            .aria_expanded(menu_open)
+            .group("branch-actions")
+            .relative()
+            .size(px(24.))
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_md()
+            .child(self.branch_anchor.probe())
+            .when(busy, |d| d.opacity(0.4))
+            .when(menu_open, |d| d.bg(content(0.1)))
+            .when(!busy && !menu_open, |d| d.hover(|s| s.bg(content(0.05))))
+            .child(if self.busy.as_deref() == Some("pull") {
+                spinner("pull-spin", "loader", 14.)
+            } else {
+                icon("more-horizontal", 16.)
+                    .text_color(content(if menu_open { 1. } else { 0.5 }))
+                    .group_hover("branch-actions", |s| s.text_color(content(1.)))
+                    .into_any_element()
+            })
+            .when(!busy, |d| {
+                d.on_click(
+                    cx.listener(|this, _, window, cx| this.open_menu(MenuKind::Branch, window, cx)),
+                )
+            })
+            .into_any_element()
+    }
+    fn header(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let index = self.git.read(cx).index.clone();
         let branch = index.as_ref().and_then(|i| i.branch.clone());
         let index = index.unwrap_or_default();
         pane_header("changes-header", "Changes")
@@ -1020,40 +1213,7 @@ impl Changes {
                 )
             })
             .child(div().ml_auto())
-            .when(branch.is_some(), |d| {
-                d.child(
-                    div()
-                        .id("branch-actions")
-                        .role(Role::Button)
-                        .aria_label("Branch actions")
-                        .aria_expanded(menu_open)
-                        .group("branch-actions")
-                        .relative()
-                        .size(px(24.))
-                        .flex_shrink_0()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded_md()
-                        .child(self.branch_anchor.probe())
-                        .when(busy, |d| d.opacity(0.4))
-                        .when(menu_open, |d| d.bg(content(0.1)))
-                        .when(!busy && !menu_open, |d| d.hover(|s| s.bg(content(0.05))))
-                        .child(if self.busy.as_deref() == Some("pull") {
-                            spinner("pull-spin", "loader", 14.)
-                        } else {
-                            icon("more-horizontal", 16.)
-                                .text_color(content(if menu_open { 1. } else { 0.5 }))
-                                .group_hover("branch-actions", |s| s.text_color(content(1.)))
-                                .into_any_element()
-                        })
-                        .when(!busy, |d| {
-                            d.on_click(cx.listener(|this, _, window, cx| {
-                                this.open_menu(MenuKind::Branch, window, cx)
-                            }))
-                        }),
-                )
-            })
+            .when(branch.is_some(), |d| d.child(self.branch_actions(cx)))
     }
 
     fn commit_box(&self, cx: &mut Context<Self>) -> impl IntoElement {

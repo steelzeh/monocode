@@ -7,7 +7,13 @@ pub fn default_root(main: &Path) -> PathBuf {
     ))
 }
 pub fn status(cwd: &Path, tree: &crate::git::Worktree) -> (bool, Option<bool>, usize) {
-    let locked = crate::git::git(cwd, &["worktree", "list", "--porcelain", "-z"])
+    // Git knows a submodule's worktree only from inside that submodule.
+    let repo = if tree.submodule.is_some() {
+        Path::new(&tree.path)
+    } else {
+        cwd
+    };
+    let locked = crate::git::git(repo, &["worktree", "list", "--porcelain", "-z"])
         .ok()
         .is_some_and(|s| {
             s.split("\0\0").any(|block| {
@@ -47,6 +53,13 @@ pub fn check(cwd: &Path, path: &Path) -> Result<crate::git::Worktree, String> {
         .ok_or("This path is not a registered worktree of this repository")?;
     if tree.main {
         return Err("The main working copy cannot be deleted".into());
+    }
+    // Removal is forced and a project's own tooling may track these worktrees,
+    // so only the repository that owns one should remove it.
+    if let Some(submodule) = &tree.submodule {
+        return Err(format!(
+            "This worktree belongs to the {submodule} submodule. Remove it from that repository."
+        ));
     }
     if tree.branch.is_none() {
         return Err("Create a branch for this detached worktree before deleting it.".into());

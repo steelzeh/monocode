@@ -3,11 +3,14 @@
 //! lanes that scroll horizontally together, hunk navigation, per-file and
 //! per-hunk staging, and line comments for the chat. Highlighting runs off
 //! the UI thread, one file at a time, only for files that are on screen.
+//! Review files show one whole file: each change ends in a bar to keep or undo
+//! it, and a floating bar steps through its changes and the other files.
 use crate::{
     file_icons::file_type_icon,
     input::{self, Input},
     popover::{AnchorSlot, Side, popover},
-    right_panel::{DIFF_ADD, DIFF_DEL, format_integer, stroke, tabular},
+    review_bar::{self, pill},
+    right_panel::{DIFF_ADD, DIFF_DEL, RED_400, format_integer, stroke, tabular},
     syntax::{HighlightRequest, HighlightSpan},
     theme::*,
 };
@@ -30,16 +33,21 @@ pub(crate) const FILE_HEADER: f32 = 40.;
 const LINE: f32 = 20.;
 const HUNK: f32 = 28.;
 const NOTICE: f32 = 44.;
+/// The keep and undo bar under each change of a review file.
+const ACTIONS: f32 = 32.;
+/// Room under a review file, so the floating bar never covers its last line.
+const BAR_CLEARANCE: f32 = 72.;
 /// `--code-font-size`.
 const CODE_SIZE: f32 = 12.5;
 const MAX_HIGHLIGHT_CHARS: usize = 250_000;
 
-actions!(diff_review, [PreviousHunk, NextHunk]);
+actions!(diff_review, [PreviousHunk, NextHunk, KeepAllChanges]);
 
 pub(crate) fn bind(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("alt-up", PreviousHunk, Some("DiffReview")),
         KeyBinding::new("alt-down", NextHunk, Some("DiffReview")),
+        KeyBinding::new("cmd-enter", KeepAllChanges, Some("DiffReview")),
     ]);
 }
 
@@ -58,8 +66,23 @@ pub(crate) struct DiffFile {
     pub can_stage: bool,
     pub can_discard: bool,
     pub can_stage_hunk: bool,
+    /// Agent work to keep or undo, change by change, shown as the whole file.
+    pub review: bool,
+}
+/// Which of the reviewed files this view shows.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ReviewNav {
+    pub file: usize,
+    pub files: usize,
 }
 impl DiffFile {
+    /// Keeping needs no text, so binary and very large files can be kept too.
+    /// A file still loading or that failed to load cannot.
+    fn can_keep(&self) -> bool {
+        self.empty_message
+            .as_deref()
+            .is_none_or(|message| message == "No textual diff")
+    }
     fn message(&self) -> Option<String> {
         if self.binary {
             Some("Binary file changed".into())
@@ -81,8 +104,17 @@ impl DiffFile {
             && self.empty_message == other.empty_message
             && self.additions == other.additions
             && self.deletions == other.deletions
-            && (self.can_stage, self.can_discard, self.can_stage_hunk)
-                == (other.can_stage, other.can_discard, other.can_stage_hunk)
+            && (
+                self.can_stage,
+                self.can_discard,
+                self.can_stage_hunk,
+                self.review,
+            ) == (
+                other.can_stage,
+                other.can_discard,
+                other.can_stage_hunk,
+                other.review,
+            )
     }
 }
 
@@ -90,6 +122,12 @@ pub(crate) enum DiffEvent {
     StageFile(SharedString),
     DiscardFile(SharedString),
     StageHunk(SharedString, usize),
+    KeepHunk(SharedString, usize),
+    UndoHunk(SharedString, usize),
+    KeepFile(SharedString),
+    UndoFile(SharedString),
+    /// Show the reviewed file this many places along.
+    StepFile(isize),
     /// Text for the active chat's composer.
     Comment(String),
 }
@@ -104,6 +142,9 @@ enum RowKind {
     },
     Hunk(SharedString),
     Notice(SharedString),
+    /// After a review change's last line: its keep and undo bar.
+    Actions(usize),
+    Spacer,
 }
 #[derive(Clone)]
 struct Row {
@@ -118,11 +159,13 @@ struct Body {
     blocks: Arc<Vec<Block>>,
     message: Option<String>,
     stageable: bool,
+    review: bool,
     rows: Vec<Row>,
     columns: usize,
     digits: usize,
 }
 fn build_body(file: &DiffFile, message: Option<String>, stageable: bool) -> Body {
+    let review = file.review;
     let mut rows = Vec::new();
     let (mut columns, mut digits) = (40, 3);
     if let Some(text) = &message {
@@ -136,10 +179,11 @@ fn build_body(file: &DiffFile, message: Option<String>, stageable: bool) -> Body
             let Block::Hunk { lines, chunk } = block else {
                 continue;
             };
+            let block_chunk = *chunk;
             let changes = lines
                 .iter()
                 .any(|l| matches!(l.kind, LineKind::Add | LineKind::Del));
-            if changes && !lines.iter().any(|l| l.kind == LineKind::Hunk) {
+            if changes && !review && !lines.iter().any(|l| l.kind == LineKind::Hunk) {
                 rows.push(Row {
                     file: 0,
                     kind: RowKind::Hunk(hunk_range(lines).into()),
@@ -148,6 +192,9 @@ fn build_body(file: &DiffFile, message: Option<String>, stageable: bool) -> Body
             }
             for (i, line) in lines.iter().enumerate() {
                 if line.kind == LineKind::Hunk {
+                    if review {
+                        continue;
+                    }
                     rows.push(Row {
                         file: 0,
                         kind: RowKind::Hunk(line.text.clone().into()),
@@ -155,9 +202,10 @@ fn build_body(file: &DiffFile, message: Option<String>, stageable: bool) -> Body
                     });
                     continue;
                 }
-                let stage = (stageable && matches!(line.kind, LineKind::Add | LineKind::Del))
-                    .then(|| line.chunk.or(*chunk))
-                    .flatten();
+                let stage = ((stageable || review)
+                    && matches!(line.kind, LineKind::Add | LineKind::Del))
+                .then(|| line.chunk.or(*chunk))
+                .flatten();
                 rows.push(Row {
                     file: 0,
                     kind: RowKind::Line {
@@ -167,6 +215,20 @@ fn build_body(file: &DiffFile, message: Option<String>, stageable: bool) -> Body
                     },
                     height: LINE,
                 });
+                // A review change ends where the next line leaves its chunk.
+                if review && let Some(chunk) = stage {
+                    let next = lines.get(i + 1).filter(|next| {
+                        matches!(next.kind, LineKind::Add | LineKind::Del)
+                            && next.chunk.or(block_chunk) == Some(chunk)
+                    });
+                    if next.is_none() {
+                        rows.push(Row {
+                            file: 0,
+                            kind: RowKind::Actions(chunk),
+                            height: ACTIONS,
+                        });
+                    }
+                }
                 columns = columns.max(diff::visual_columns(&line.text));
                 digits = digits
                     .max(line.old_number.unwrap_or(0).to_string().len())
@@ -174,10 +236,18 @@ fn build_body(file: &DiffFile, message: Option<String>, stageable: bool) -> Body
             }
         }
     }
+    if review && message.is_none() {
+        rows.push(Row {
+            file: 0,
+            kind: RowKind::Spacer,
+            height: BAR_CLEARANCE,
+        });
+    }
     Body {
         blocks: file.blocks.clone(),
         message,
         stageable,
+        review,
         rows,
         columns,
         digits,
@@ -298,6 +368,10 @@ pub(crate) struct DiffView {
     pending: Option<usize>,
     focus_id: Option<SharedString>,
     pub(crate) busy_id: Option<SharedString>,
+    /// Why the last keep or undo failed, shown above the review bar.
+    pub(crate) review_error: Option<SharedString>,
+    /// Set for an Agent Changes tab, even while its file loads.
+    pub(crate) review_nav: Option<ReviewNav>,
     pub(crate) file_count: Option<usize>,
     pub(crate) totals: Option<(u32, u32)>,
     highlights: HashMap<SharedString, (Arc<Vec<Block>>, Option<Tokens>)>,
@@ -351,6 +425,8 @@ impl DiffView {
             pending: None,
             focus_id: None,
             busy_id: None,
+            review_error: None,
+            review_nav: None,
             file_count: None,
             totals: None,
             highlights: HashMap::new(),
@@ -412,6 +488,8 @@ impl DiffView {
             RowKind::Line { block, line, .. } => RowKey(id, 1, *block, *line),
             RowKind::Hunk(_) => RowKey(id, 2, ix, 0),
             RowKind::Notice(_) => RowKey(id, 3, 0, 0),
+            RowKind::Actions(chunk) => RowKey(id, 4, *chunk, 0),
+            RowKind::Spacer => RowKey(id, 5, 0, 0),
         })
     }
     fn rebuild(&mut self, cx: &mut Context<Self>) {
@@ -440,6 +518,7 @@ impl DiffView {
                 !Arc::ptr_eq(&b.blocks, &file.blocks)
                     || b.message != message
                     || b.stageable != stageable
+                    || b.review != file.review
             });
             if stale {
                 self.bodies
@@ -454,8 +533,21 @@ impl DiffView {
                 height: FILE_HEADER,
             });
             let start = rows.len();
+            let mut previous = None;
             for (i, row) in body.rows.iter().enumerate() {
-                if matches!(row.kind, RowKind::Hunk(_)) {
+                // A review steps through changes; other diffs through hunks.
+                let starts = if body.review {
+                    let chunk = match row.kind {
+                        RowKind::Line { stage, .. } => stage,
+                        _ => None,
+                    };
+                    let starts = chunk.is_some() && chunk != previous;
+                    previous = chunk;
+                    starts
+                } else {
+                    matches!(row.kind, RowKind::Hunk(_))
+                };
+                if starts {
                     hunks.push((index, expanded.then_some(start + i)));
                 }
             }
@@ -650,7 +742,13 @@ impl DiffView {
         }
         let current = self.current_hunk().map_or(-1, |i| i as isize);
         let index = (current + direction).clamp(0, self.hunks.len() as isize - 1) as usize;
-        let (file, _) = self.hunks[index];
+        self.jump_hunk(index, cx);
+    }
+    /// Scroll so hunk `index` sits under the pinned header.
+    fn jump_hunk(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(&(file, _)) = self.hunks.get(index) else {
+            return;
+        };
         let id = self.files[file].id.clone();
         if self.open.insert(id) {
             self.rebuild(cx);
@@ -660,6 +758,22 @@ impl DiffView {
             self.scroll_to_px(self.offsets[*row] - FILE_HEADER - 8.);
         }
         cx.notify();
+    }
+    fn reviewing(&self) -> bool {
+        self.review_nav.is_some()
+    }
+    #[cfg(test)]
+    pub(crate) fn shown_ids(&self) -> Vec<String> {
+        self.files.iter().map(|file| file.id.to_string()).collect()
+    }
+    /// Keep the file on screen. The next file opens once this one is settled.
+    fn keep_current(&mut self, cx: &mut Context<Self>) {
+        if !self.reviewing() || self.busy_id.is_some() {
+            return;
+        }
+        if let Some(file) = self.files.first().filter(|file| file.can_keep()) {
+            cx.emit(DiffEvent::KeepFile(file.id.clone()));
+        }
     }
     fn toggle(&mut self, file: usize, cx: &mut Context<Self>) {
         let id = self.files[file].id.clone();
@@ -1024,6 +1138,26 @@ impl DiffView {
                     .on_click(cx.listener(move |this, _, _, cx| this.toggle(file, cx))),
             )
             .child(diff_counts(f.additions, f.deletions))
+            .when(f.review, |d| {
+                let undo_id = id.clone();
+                d.child(
+                    pill(("undo-file", file), "Undo file", false, !busy).when(!busy, |d| {
+                        d.on_click(cx.listener(move |_, _, _, cx| {
+                            cx.emit(DiffEvent::UndoFile(undo_id.clone()))
+                        }))
+                    }),
+                )
+            })
+            .when(self.reviewing() && f.can_keep(), |d| {
+                let keep_id = id.clone();
+                d.child(
+                    pill(("keep-file", file), "Keep file", true, !busy).when(!busy, |d| {
+                        d.on_click(cx.listener(move |_, _, _, cx| {
+                            cx.emit(DiffEvent::KeepFile(keep_id.clone()))
+                        }))
+                    }),
+                )
+            })
             .when(f.can_discard, |d| {
                 d.child(
                     tool_button(("discard-file", file), "Discard file", "undo", !busy).when(
@@ -1051,6 +1185,215 @@ impl DiffView {
             .into_any_element()
     }
 
+    /// Under a review change: its place among all changes, and keep or undo.
+    fn change_bar(
+        &self,
+        ix: usize,
+        file: usize,
+        chunk: usize,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let f = &self.files[file];
+        let busy = self.busy_id.as_ref() == Some(&f.id);
+        let total = self.hunks.len();
+        // This change is the last one that starts above its bar.
+        let number = self
+            .hunks
+            .iter()
+            .filter(|(_, row)| row.is_some_and(|row| row < ix))
+            .count();
+        let (undo_id, keep_id) = (f.id.clone(), f.id.clone());
+        div()
+            .id(("diff-change-bar", ix))
+            .h(px(ACTIONS))
+            .w_full()
+            .flex()
+            .items_center()
+            .justify_end()
+            .gap_1()
+            .pr_4()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(2.))
+                    .h(px(24.))
+                    .px_1()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(stroke())
+                    .bg(crate::theme::background_base())
+                    .child(
+                        tool_button(
+                            ("change-previous", ix),
+                            "Previous change",
+                            "chevron-up",
+                            number > 1,
+                        )
+                        .size(px(20.))
+                        .when(number > 1, |d| {
+                            d.on_click(
+                                cx.listener(move |this, _, _, cx| this.jump_hunk(number - 2, cx)),
+                            )
+                        }),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .font_features(tabular())
+                            .text_color(content(0.6))
+                            .child(format!("{number} of {total}")),
+                    )
+                    .child(
+                        tool_button(
+                            ("change-next", ix),
+                            "Next change",
+                            "chevron-down",
+                            number < total,
+                        )
+                        .size(px(20.))
+                        .when(number < total, |d| {
+                            d.on_click(
+                                cx.listener(move |this, _, _, cx| this.jump_hunk(number, cx)),
+                            )
+                        }),
+                    ),
+            )
+            .child(
+                pill(("undo-change", ix), "Undo", false, !busy).when(!busy, |d| {
+                    d.on_click(cx.listener(move |_, _, _, cx| {
+                        cx.emit(DiffEvent::UndoHunk(undo_id.clone(), chunk))
+                    }))
+                }),
+            )
+            .child(
+                pill(("keep-change", ix), "Keep", true, !busy).when(!busy, |d| {
+                    d.on_click(cx.listener(move |_, _, _, cx| {
+                        cx.emit(DiffEvent::KeepHunk(keep_id.clone(), chunk))
+                    }))
+                }),
+            )
+            .into_any_element()
+    }
+
+    /// The floating bar of a review: this file's changes, Undo All and
+    /// Keep All for this file, then the other files.
+    fn review_island(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let nav = self.review_nav?;
+        let shown = self.files.first()?;
+        let busy = self.busy_id.is_some();
+        let total = self.hunks.len();
+        let current = self.current_hunk();
+        let can_prev = current.is_some_and(|c| c > 0);
+        let can_next = total > 0 && current.is_none_or(|c| c + 1 < total);
+        let can_undo = !busy && shown.review;
+        let can_keep = !busy && shown.can_keep();
+        let (previous_file, next_file) = (nav.file > 0, nav.file + 1 < nav.files);
+        let undo_id = shown.id.clone();
+        Some(
+            review_bar::overlay("review-island")
+                .when_some(self.review_error.clone(), |d, error| {
+                    d.child(
+                        div().w_full().flex().justify_center().child(
+                            div()
+                                .max_w(px(520.))
+                                .px_3()
+                                .py_1()
+                                .rounded_md()
+                                .bg(crate::theme::background_base())
+                                .border_1()
+                                .border_color(rgb(RED_400))
+                                .text_size(px(12.))
+                                .text_color(content(0.9))
+                                .child(error),
+                        ),
+                    )
+                })
+                .child(
+                    review_bar::surface()
+                        .child(
+                            tool_button(
+                                "island-previous-change",
+                                "Previous change",
+                                "chevron-up",
+                                can_prev,
+                            )
+                            .when(can_prev, |d| {
+                                d.on_click(cx.listener(|this, _, _, cx| this.navigate(-1, cx)))
+                            }),
+                        )
+                        .child(
+                            div()
+                                .min_w(px(40.))
+                                .text_center()
+                                .child(format!("{} / {total}", current.map_or(0, |c| c + 1))),
+                        )
+                        .child(
+                            tool_button(
+                                "island-next-change",
+                                "Next change",
+                                "chevron-down",
+                                can_next,
+                            )
+                            .when(can_next, |d| {
+                                d.on_click(cx.listener(|this, _, _, cx| this.navigate(1, cx)))
+                            }),
+                        )
+                        .child(div().mx_1().h(px(14.)).w(px(1.)).bg(stroke()))
+                        .child(pill("undo-all-changes", "Undo All", false, can_undo).when(
+                            can_undo,
+                            |d| {
+                                d.on_click(cx.listener(move |_, _, _, cx| {
+                                    cx.emit(DiffEvent::UndoFile(undo_id.clone()))
+                                }))
+                            },
+                        ))
+                        .child(
+                            pill("keep-all-changes", "Keep All ⌘↩", true, can_keep)
+                                .when(can_keep, |d| {
+                                    d.on_click(cx.listener(|this, _, _, cx| this.keep_current(cx)))
+                                }),
+                        ),
+                )
+                .child(
+                    review_bar::surface()
+                        .child(
+                            tool_button(
+                                "island-previous-file",
+                                "Previous file",
+                                "chevron-left",
+                                previous_file,
+                            )
+                            .when(previous_file, |d| {
+                                d.on_click(
+                                    cx.listener(|_, _, _, cx| cx.emit(DiffEvent::StepFile(-1))),
+                                )
+                            }),
+                        )
+                        .child(div().px_1().child(format!(
+                            "{} / {} {}",
+                            nav.file + 1,
+                            nav.files,
+                            if nav.files == 1 { "file" } else { "files" }
+                        )))
+                        .child(
+                            tool_button(
+                                "island-next-file",
+                                "Next file",
+                                "chevron-right",
+                                next_file,
+                            )
+                            .when(next_file, |d| {
+                                d.on_click(
+                                    cx.listener(|_, _, _, cx| cx.emit(DiffEvent::StepFile(1))),
+                                )
+                            }),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
     fn row(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let Some(row) = self.rows.get(ix).cloned() else {
             return div().into_any_element();
@@ -1060,6 +1403,8 @@ impl DiffView {
         let accent: Hsla = accent_color();
         match row.kind {
             RowKind::File => self.file_header(row.file, false, cx),
+            RowKind::Actions(chunk) => self.change_bar(ix, row.file, chunk, cx),
+            RowKind::Spacer => div().h(px(BAR_CLEARANCE)).into_any_element(),
             RowKind::Notice(text) => div()
                 .h(px(NOTICE))
                 .w_full()
@@ -1108,6 +1453,8 @@ impl DiffView {
                 .into_any_element(),
             RowKind::Line { block, line, stage } => {
                 let file = &self.files[row.file];
+                // Review changes are kept or undone from the bar below them.
+                let stage = stage.filter(|_| !file.review);
                 let Some(l) = file.blocks.get(block).and_then(|b| b.lines().get(line)) else {
                     return div().h(px(LINE)).into_any_element();
                 };
@@ -1423,7 +1770,7 @@ pub(crate) fn diff_counts(additions: u32, deletions: u32) -> AnyElement {
 }
 
 /// UnifiedDiffView's IconButton: 24px, 45% ink, 30% when disabled.
-fn tool_button(
+pub(crate) fn tool_button(
     id: impl Into<gpui::ElementId>,
     label: &'static str,
     path: &'static str,
@@ -1487,6 +1834,7 @@ impl Render for DiffView {
         let view_id = cx.entity_id();
         let weak = cx.weak_entity();
         let sticky = self.sticky_header(cx);
+        let island = self.review_island(cx);
         let comment = self.comment.as_ref().map(|c| {
             let location = diff::comment_location(&c.path, &c.line);
             let can_add = !c.input.read(cx).content.trim().is_empty();
@@ -1603,6 +1951,7 @@ impl Render for DiffView {
             .overflow_hidden()
             .on_action(cx.listener(|this, _: &PreviousHunk, _, cx| this.navigate(-1, cx)))
             .on_action(cx.listener(|this, _: &NextHunk, _, cx| this.navigate(1, cx)))
+            .on_action(cx.listener(|this, _: &KeepAllChanges, _, cx| this.keep_current(cx)))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, window, cx| {
@@ -1655,7 +2004,8 @@ impl Render for DiffView {
                     }
                 }),
             )
-            .child(self.toolbar(cx))
+            // The floating bar replaces the toolbar in a review.
+            .children((!self.reviewing()).then(|| self.toolbar(cx)))
             .child(
                 div()
                     .id("unified-diff")
@@ -1705,7 +2055,8 @@ impl Render for DiffView {
                         .size_full(),
                     )
                     .children(sticky)
-                    .child(self.overview(cx)),
+                    .child(self.overview(cx))
+                    .children(island),
             )
             .child(self.horizontal_bar(cx))
             .children(comment)
@@ -1809,6 +2160,18 @@ mod tests {
             can_stage: true,
             can_discard: true,
             can_stage_hunk: true,
+            review: false,
+        }
+    }
+    fn review_file(id: &str, original: &str, current: &str) -> DiffFile {
+        let unified = diff::build_unified_file(original, current, usize::MAX);
+        DiffFile {
+            blocks: Arc::new(unified.blocks),
+            can_stage: false,
+            can_discard: false,
+            can_stage_hunk: false,
+            review: true,
+            ..file(id, original, current)
         }
     }
     #[gpui::test]
@@ -1945,5 +2308,109 @@ mod tests {
             RowKind::Notice(t) if t.as_ref() == "Binary file changed")
         );
         assert_eq!(expand_tabs("\tab\tc"), "    ab  c");
+    }
+    #[test]
+    fn review_files_show_the_whole_file_with_a_bar_after_each_change() {
+        let f = review_file(
+            "a.rs",
+            "1\n2\n3\n4\n5\n6\n7\n8\n9\n",
+            "1\nTWO\n3\n4\n5\n6\n7\nEIGHT\n9\n",
+        );
+        let body = build_body(&f, f.message(), false);
+        let kinds: Vec<String> = body
+            .rows
+            .iter()
+            .map(|r| match &r.kind {
+                RowKind::Line { stage: Some(c), .. } => format!("change {c}"),
+                RowKind::Line { .. } => "line".into(),
+                RowKind::Actions(c) => format!("bar {c}"),
+                RowKind::Hunk(_) => "hunk".into(),
+                _ => "other".into(),
+            })
+            .collect();
+        // Every line of the file, no hunk headers, a bar after each change.
+        assert_eq!(
+            kinds,
+            [
+                "line", "change 0", "change 0", "bar 0", "line", "line", "line", "line", "line",
+                "change 1", "change 1", "bar 1", "line", "other",
+            ]
+        );
+    }
+
+    #[gpui::test]
+    fn the_review_bar_steps_through_changes_across_files_and_keeps_all(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx) = cx.add_window_view(|_, cx| DiffView::new(cx));
+        let events = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let seen = events.clone();
+        view.update(cx, |view, cx| {
+            cx.subscribe(&cx.entity(), move |_, _, event: &DiffEvent, _| {
+                if let DiffEvent::KeepFile(id) = event {
+                    seen.borrow_mut().push(id.to_string());
+                }
+            })
+            .detach();
+            view.set_files(
+                vec![
+                    review_file(
+                        "a.rs",
+                        "1\n2\n3\n4\n5\n6\n7\n8\n",
+                        "1\nTWO\n3\n4\n5\n6\n7\nEIGHT\n",
+                    ),
+                    review_file("b.rs", "x\n", "y\n"),
+                ],
+                cx,
+            );
+            view.review_nav = Some(ReviewNav { file: 0, files: 2 });
+            // Changes, not hunks: two in the first file, one in the second.
+            assert_eq!(view.hunks.len(), 3);
+            assert!(view.reviewing());
+            view.jump_hunk(2, cx);
+        });
+        cx.run_until_parked();
+        view.update(cx, |view, _| {
+            assert_eq!(view.hunks[2].0, 1);
+        });
+        view.update_in(cx, |view, window, cx| {
+            window.focus(&view.focus, cx);
+        });
+        cx.dispatch_action(KeepAllChanges);
+        cx.run_until_parked();
+        assert_eq!(*events.borrow(), ["a.rs"]);
+        // No Keep All for a plain diff.
+        view.update(cx, |view, cx| {
+            view.review_nav = None;
+            view.set_files(vec![file("c.rs", "a\n", "b\n")], cx);
+            assert!(!view.reviewing());
+        });
+    }
+
+    #[gpui::test]
+    fn the_bar_stays_while_a_file_loads_and_binary_files_can_be_kept(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx) = cx.add_window_view(|_, cx| DiffView::new(cx));
+        let mut loading = review_file("a.rs", "a\n", "b\n");
+        loading.review = false;
+        loading.empty_message = Some("Loading…".into());
+        assert!(!loading.can_keep());
+        let binary = DiffFile {
+            binary: true,
+            review: false,
+            ..loading.clone()
+        };
+        assert!(!binary.can_keep(), "still loading");
+        let binary = DiffFile {
+            empty_message: None,
+            ..binary
+        };
+        assert!(binary.can_keep());
+        view.update(cx, |view, cx| {
+            view.review_nav = Some(ReviewNav { file: 1, files: 3 });
+            view.set_files(vec![loading], cx);
+            assert!(view.reviewing());
+        });
     }
 }

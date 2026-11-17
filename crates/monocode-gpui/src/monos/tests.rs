@@ -396,7 +396,7 @@ fn call(
         request_id: request.into(),
         action: action.into(),
         input,
-        reply,
+        reply: reply.into(),
     };
     let handle: gpui::AnyWindowHandle = s.window.into();
     handle
@@ -708,7 +708,7 @@ fn app_receipt_lookup_does_not_wait_for_storage_on_the_ui_thread(cx: &mut TestAp
         request_id: "contended-lookup".into(),
         action: "sessions.list".into(),
         input: json!({}),
-        reply,
+        reply: reply.into(),
     };
     s.window
         .update(cx, |_, window, cx| {

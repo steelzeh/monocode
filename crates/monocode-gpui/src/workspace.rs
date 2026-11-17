@@ -101,6 +101,13 @@ pub(crate) struct Workspace {
     pub sidebar_automations_visible: bool,
     pub sidebar_inbox_visible: bool,
     pub sidebar_activity_visible: bool,
+    /// Lists every project as a folder of its chats in the Focused sidebar,
+    /// in place of the project picker and spaces bar.
+    pub sidebar_project_folders: bool,
+    /// The project the sidebar shows on its own, instead of the project list.
+    pub sidebar_focused_project: Option<String>,
+    /// Chats listed under another project than the folder they work in.
+    pub session_projects: HashMap<i64, String>,
     /// The inset right panel: open state, tab, width and tab order.
     pub right_panel_open: bool,
     pub right_panel_tab: crate::right_panel::RightTab,
@@ -331,6 +338,9 @@ impl Default for Workspace {
             sidebar_automations_visible: true,
             sidebar_inbox_visible: true,
             sidebar_activity_visible: true,
+            sidebar_project_folders: false,
+            sidebar_focused_project: None,
+            session_projects: HashMap::new(),
             right_panel_open: false,
             right_panel_tab: Default::default(),
             right_panel_width: crate::right_panel::WIDTH_DEFAULT,

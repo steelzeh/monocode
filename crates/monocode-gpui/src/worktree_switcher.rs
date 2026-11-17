@@ -74,9 +74,9 @@ fn rows(cwd: &str, state: Option<&Snapshot>, query: &str) -> Vec<Row> {
                 path: t.path.clone(),
                 branch: t.branch.clone(),
                 all: false,
-                label: t.branch.clone().unwrap_or_else(|| {
+                label: t.in_repo(t.branch.clone().unwrap_or_else(|| {
                     format!("Detached {}", t.head.chars().take(7).collect::<String>())
-                }),
+                })),
                 detail: pretty_path(&t.path),
             }),
     );
@@ -95,6 +95,24 @@ fn pretty_path(path: &str) -> String {
         return format!("~/{}", rest.display());
     }
     path.into()
+}
+/// A new worktree branches from the selected checkout, unless that checkout
+/// belongs to a submodule: this list creates worktrees of the project.
+fn create_from<'a>(
+    cwd: &'a str,
+    focused: Option<&'a WorktreeFocus>,
+    state: Option<&Snapshot>,
+) -> &'a str {
+    let in_submodule = |focus: &WorktreeFocus| {
+        state.is_some_and(|state| {
+            state.worktrees.iter().any(|tree| {
+                tree.submodule.is_some() && path_key(&tree.path) == path_key(&focus.path)
+            })
+        })
+    };
+    focused
+        .filter(|focus| !in_submodule(focus))
+        .map_or(cwd, |focus| &focus.path)
 }
 #[derive(Default)]
 struct Tabs {
@@ -264,7 +282,7 @@ impl WorktreeSwitcher {
             return;
         }
         let branch = self.query(cx);
-        let cwd = self.focused.as_ref().map_or(&self.cwd, |f| &f.path).clone();
+        let cwd = create_from(&self.cwd, self.focused.as_ref(), self.state.as_ref()).to_owned();
         self.creating = true;
         self.error = None;
         let work = cx
@@ -567,6 +585,53 @@ mod tests {
         rc::Rc,
         sync::{Arc, Mutex},
     };
+    #[test]
+    fn submodule_worktrees_name_their_repository_and_never_seed_a_new_worktree() {
+        let state = Snapshot {
+            worktrees: vec![
+                Worktree {
+                    path: "/repo".into(),
+                    branch: Some("main".into()),
+                    main: true,
+                    ..Default::default()
+                },
+                Worktree {
+                    path: "/repo/.worktrees/web-feature".into(),
+                    branch: Some("feature".into()),
+                    submodule: Some("web".into()),
+                    ..Default::default()
+                },
+                Worktree {
+                    path: "/repo-worktrees/own".into(),
+                    branch: Some("own".into()),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let labels: Vec<_> = rows("/repo", Some(&state), "")
+            .into_iter()
+            .map(|row| row.label)
+            .collect();
+        assert_eq!(labels, ["All checkouts", "main", "web: feature", "own"]);
+        assert_eq!(rows("/repo", Some(&state), "web").len(), 1);
+
+        let focus = |path: &str| WorktreeFocus {
+            path: path.into(),
+            branch: None,
+        };
+        let submodule = focus("/repo/.worktrees/web-feature");
+        let own = focus("/repo-worktrees/own");
+        assert_eq!(create_from("/repo", None, Some(&state)), "/repo");
+        assert_eq!(
+            create_from("/repo", Some(&submodule), Some(&state)),
+            "/repo"
+        );
+        assert_eq!(
+            create_from("/repo", Some(&own), Some(&state)),
+            "/repo-worktrees/own"
+        );
+    }
     fn snapshot() -> Snapshot {
         Snapshot {
             worktrees: vec![

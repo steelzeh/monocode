@@ -45,6 +45,73 @@ impl Shell {
             .then(|| crate::pane_layout::edge_from_point(x, y, rect))
     }
 
+    /// With Project folders on, the open files belong to the folder, not to
+    /// one chat. Jumping to another chat on the same folder brings them along
+    /// at the same width. A chat with files of its own keeps them, at that
+    /// width. Split tabs and file-only tabs keep their own arrangement.
+    pub(super) fn carry_file_panel(&mut self, to: i64, cx: &mut Context<Self>) {
+        if !self.project_folders_active() {
+            return;
+        }
+        let Some(from) = self.workspace.active.filter(|from| *from != to) else {
+            return;
+        };
+        let is_chat = |this: &Self, id: i64| {
+            !this.workspace.review_owners.contains_key(&id)
+                && this.session_summaries.contains_key(&id)
+        };
+        let split = |this: &Self, id: i64| {
+            this.workspace
+                .tab_of(id)
+                .is_some_and(|tab| this.workspace.layout(tab).is_split())
+        };
+        if !is_chat(self, from) || !is_chat(self, to) || split(self, from) || split(self, to) {
+            return;
+        }
+        let state = match self.reviews.get(&from) {
+            Some(review) => Some(review.read(cx).state.clone()),
+            None => self.workspace.reviews.get(&from).cloned(),
+        };
+        let Some(state) = state.filter(|s| !s.chat_hidden && !s.tabs.is_empty()) else {
+            return;
+        };
+        if monocode_core::files::path_key(self.session_working_copy(from, cx))
+            != monocode_core::files::path_key(self.session_working_copy(to, cx))
+        {
+            return;
+        }
+        // A pane that is live may not have saved its state yet.
+        if let Some(review) = self.reviews.get(&to) {
+            review.update(cx, |review, cx| {
+                if !review.state.chat_hidden {
+                    review.state.ratio = state.ratio;
+                    cx.notify();
+                }
+            });
+        }
+        if self.reviews.contains_key(&to) || self.workspace.reviews.contains_key(&to) {
+            if let Some(target) = self.workspace.reviews.get_mut(&to)
+                && !target.chat_hidden
+            {
+                target.ratio = state.ratio;
+            }
+            return;
+        }
+        self.workspace.reviews.remove(&from);
+        self.workspace.reviews.insert(to, state);
+        // The pane finds its chat by looking itself up, so it can just move.
+        if let Some(review) = self.reviews.remove(&from) {
+            self.reviews.insert(to, review);
+        }
+        if self
+            .review_slide
+            .as_ref()
+            .is_some_and(|(id, _, _)| *id == from)
+        {
+            self.review_slide = None;
+        }
+    }
+
     fn take_review_pane(&mut self, id: i64, cx: &mut Context<Self>) -> Option<i64> {
         if self.workspace.review_owners.contains_key(&id)
             || self
@@ -78,10 +145,10 @@ impl Shell {
         if self.deleting.contains(&owner) {
             return;
         }
-        let Some(session) = self.ensure_session(owner, cx) else {
+        if self.ensure_session(owner, cx).is_none() {
             return;
-        };
-        self.workspace.project = session.read(cx).summary.cwd.clone();
+        }
+        self.workspace.project = self.session_project(owner, cx).to_owned();
         if let Some(monos) = &self.monos {
             monos.update(cx, |m, cx| m.close(cx));
         }

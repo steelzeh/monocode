@@ -125,7 +125,7 @@ impl SettingsView {
             Some("format-on-save"),
             true,
             "Format on save",
-            Some("Format supported files with Prettier before saving.".into()),
+            Some("Format supported files with Prettier before saving, using each project's Prettier settings.".into()),
             vec![self.toggle(
                 "format-on-save",
                 "Format on save",

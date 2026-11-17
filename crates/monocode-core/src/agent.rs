@@ -117,6 +117,14 @@ pub struct Settings {
     pub internal_message: bool,
     #[serde(skip)]
     pub attachments: Vec<std::path::PathBuf>,
+    /// The provider session a forked chat copies on its first turn. The store
+    /// keeps it apart from saved settings until the provider confirms the fork.
+    #[serde(skip)]
+    pub fork_from: Option<String>,
+    /// The user linked this chat with another one, so its agent must reach
+    /// the app to read that chat and to send it messages.
+    #[serde(skip)]
+    pub chat_links: bool,
     pub revision: u64,
     pub model: Option<String>,
     pub effort: Option<String>,
@@ -228,13 +236,13 @@ pub enum Decision {
     Answer(Vec<Vec<String>>),
     KeepOpen,
 }
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct QuestionOption {
     pub id: String,
     pub label: String,
     pub description: String,
 }
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct QuestionItem {
     pub id: String,
     pub prompt: String,
@@ -242,7 +250,7 @@ pub struct QuestionItem {
     pub allow_custom: bool,
     pub options: Vec<QuestionOption>,
 }
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Question {
     pub id: String,
     pub title: String,

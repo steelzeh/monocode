@@ -85,7 +85,7 @@ impl SettingsView {
                         } else {
                             "Status unavailable"
                         };
-                        let blocked = tree.locked || t.branch.is_none();
+                        let blocked = tree.locked || t.branch.is_none() || t.submodule.is_some();
                         div()
                             .p_4()
                             .flex()
@@ -146,7 +146,7 @@ impl SettingsView {
                                             .text_size(px(11.))
                                             .text_color(content(0.55))
                                             .child(format!(
-                                                "{count} {} in this worktree · {status}{}{}",
+                                                "{count} {} in this worktree · {status}{}{}{}",
                                                 if count == 1 { "session" } else { "sessions" },
                                                 if tree.unpushed > 0 {
                                                     format!(
@@ -156,7 +156,11 @@ impl SettingsView {
                                                 } else {
                                                     String::new()
                                                 },
-                                                if tree.locked { " · Locked" } else { "" }
+                                                if tree.locked { " · Locked" } else { "" },
+                                                t.submodule
+                                                    .as_ref()
+                                                    .map(|s| format!(" · In the {s} submodule"))
+                                                    .unwrap_or_default()
                                             )),
                                     ),
                             )

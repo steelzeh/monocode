@@ -1935,6 +1935,7 @@ impl Render for Input {
                 InputElement { input: cx.entity() }.into_any_element()
             })
             .children(self.code_tooltip())
+            .children(self.error_tooltip())
             .children(self.completion_popup(cx))
             .children(self.hunk_actions(cx))
             .children(self.editing_menu(cx))

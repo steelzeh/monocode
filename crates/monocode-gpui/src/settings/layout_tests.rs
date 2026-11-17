@@ -194,3 +194,171 @@ fn mono_mascot_is_beside_name_and_sidebar_switch_stays_visible(cx: &mut TestAppC
     assert_eq!(switch.size, size(px(36.), px(20.)));
     assert!(switch.right() <= px(700.));
 }
+
+#[gpui::test]
+fn a_tweak_row_shows_its_version_author_and_permissions_as_labels(cx: &mut TestAppContext) {
+    use monocode_core::tweaks::{Found, Manifest, Tweak};
+    let manifest: Manifest = serde_json::from_value(serde_json::json!({
+        "id": "t", "name": "Title", "version": "v1.2.0", "author": "steelzeh",
+        "description": "Write a new title.",
+        "permissions": ["sessions.read", "models.ask"],
+        "script": "main.js",
+        "menu": [{"id": "go", "label": "Regenerate title"}],
+        "commands": [{"name": "retitle", "prompt": "Retitle"}]
+    }))
+    .unwrap();
+    assert_eq!(
+        super::pages::tweak_meta_line(&manifest, None),
+        "v1.2.0 · by steelzeh"
+    );
+    let labels = |manifest: &Manifest| {
+        super::pages::tweak_adds_labels(manifest)
+            .into_iter()
+            .map(|(_, label)| label)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        labels(&manifest),
+        ["/retitle", "Chat menu: Regenerate title"]
+    );
+    let mut same_name = manifest.clone();
+    same_name.name = "Regenerate title".into();
+    assert_eq!(
+        labels(&same_name),
+        ["/retitle", "Chat menu"],
+        "no repeated name"
+    );
+    let mut plain = manifest.clone();
+    plain.author = Some("  ".into());
+    plain.version = "2".into();
+    assert_eq!(super::pages::tweak_meta_line(&plain, None), "v2");
+
+    let store = monocode_core::store::Store::open(std::path::Path::new(":memory:")).unwrap();
+    cx.update(|cx| {
+        crate::tweaks::install(std::sync::Arc::new(std::sync::Mutex::new(store)), cx);
+    });
+    cx.run_until_parked();
+    cx.update(|cx| {
+        crate::tweaks::get(cx).unwrap().update(cx, |center, cx| {
+            center.set_found(
+                vec![Found::Ready(Tweak {
+                    manifest,
+                    dir: "/tweaks/t".into(),
+                    panel_source: None,
+                    script_source: Some("tweak.onMenu('go', () => {});".into()),
+                    fingerprint: String::new(),
+                    source: None,
+                })],
+                cx,
+            )
+        })
+    });
+    let window = window(Section::Tweaks, cx);
+    let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+    visual.run_until_parked();
+    assert!(visual.debug_bounds("settings-tweak-meta-t").is_some());
+    let first = visual
+        .debug_bounds("settings-tweak-permission-t-0")
+        .unwrap();
+    let second = visual
+        .debug_bounds("settings-tweak-permission-t-1")
+        .unwrap();
+    assert_eq!(first.top(), second.top(), "labels sit in one row");
+    assert!(second.left() > first.right());
+    assert!(visual.debug_bounds("settings-tweak-adds-t-1").is_some());
+}
+
+#[gpui::test]
+fn add_from_github_shows_the_prompts_and_installs_only_after_confirming(cx: &mut TestAppContext) {
+    use monocode_core::tweaks::{Fetched, Found, Manifest, Source};
+    let raw = serde_json::json!({
+        "id": "standup", "name": "Standup", "version": "1.0.0", "author": "someone",
+        "description": "Write my standup.",
+        "permissions": ["send_prompts"],
+        "commands": [{"name": "standup", "prompt": "Write my standup about {{args}}"}]
+    })
+    .to_string();
+    let manifest: Manifest = serde_json::from_str(&raw).unwrap();
+    let root = std::env::temp_dir().join(format!("monocode-settings-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let store = monocode_core::store::Store::open(std::path::Path::new(":memory:")).unwrap();
+    cx.update(|cx| {
+        crate::tweaks::install(std::sync::Arc::new(std::sync::Mutex::new(store)), cx);
+        crate::tweaks::get(cx)
+            .unwrap()
+            .update(cx, |center, _| center.set_root(root.clone()));
+    });
+    cx.run_until_parked();
+    // A tweak of the same name makes the fingerprint real, through a real load.
+    std::fs::create_dir_all(root.join(".probe/standup")).unwrap();
+    std::fs::write(root.join(".probe/standup/tweak.json"), &raw).unwrap();
+    let probe = monocode_core::tweaks::discover(&root.join(".probe"));
+    let Found::Ready(probe) = &probe[0] else {
+        panic!("{probe:?}")
+    };
+    let fingerprint = probe.fingerprint.clone();
+    std::fs::remove_dir_all(root.join(".probe")).unwrap();
+    let fetched = Fetched {
+        manifest,
+        raw_manifest: raw,
+        files: Vec::new(),
+        source: Source {
+            repo: "owner/repo".into(),
+            path: String::new(),
+            commit: "abcdef0123456789abcdef0123456789abcdef01".into(),
+        },
+        fingerprint,
+    };
+    let window = window(Section::Tweaks, cx);
+    window
+        .update(cx, |view, _, cx| view.preview_tweak_for_test(fetched, cx))
+        .unwrap();
+    let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+    visual.run_until_parked();
+    assert!(visual.debug_bounds("settings-tweak-preview").is_some());
+    assert!(
+        visual
+            .debug_bounds("settings-tweak-preview-prompt-0")
+            .is_some(),
+        "the prompt is shown in full before installing"
+    );
+    assert!(
+        monocode_core::tweaks::discover(&root).is_empty(),
+        "nothing on disk yet"
+    );
+    let broken = [Found::Broken {
+        folder: "standup".into(),
+        error: "typo".into(),
+    }];
+    assert!(super::pages::tweak_replace_note(&broken, "standup").contains("broken folder"));
+    assert_eq!(
+        super::pages::tweak_replace_note(&[], "standup"),
+        "It stays off until you turn it on."
+    );
+    window
+        .update(visual, |view, _, cx| {
+            view.confirm_tweak_install_for_test(cx);
+            view.cancel_tweak_install(cx);
+            assert!(
+                view.tweak_install_open(),
+                "Cancel waits for a running install"
+            );
+        })
+        .unwrap();
+    visual.run_until_parked();
+    let found = monocode_core::tweaks::discover(&root);
+    assert_eq!(found.len(), 1);
+    window
+        .update(visual, |view, _, cx| {
+            assert!(!view.tweak_install_open(), "the form closes");
+            let center = crate::tweaks::get(cx).unwrap();
+            let center = center.read(cx);
+            let Some(Found::Ready(tweak)) = center.found().first() else {
+                panic!("the list reloads")
+            };
+            assert!(!center.is_on(tweak), "installed tweaks stay off");
+            assert_eq!(tweak.source.as_ref().unwrap().repo, "owner/repo");
+        })
+        .unwrap();
+    std::fs::remove_dir_all(&root).unwrap();
+}

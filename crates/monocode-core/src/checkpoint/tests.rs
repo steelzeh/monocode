@@ -890,3 +890,298 @@ fn checkpoints_scope_nested_workspaces_and_repositories_without_head() {
     f.store.undo("unborn", cwd, None).unwrap();
     assert!(!unborn.join("new.txt").exists());
 }
+
+fn agent_turn(f: &Fixture, session: &str, turn: &str, edit: impl FnOnce()) {
+    f.store.begin_turn(session, f.cwd(), turn).unwrap();
+    edit();
+    f.store.finish_turn(session, f.cwd(), turn).unwrap();
+}
+
+fn project_files(f: &Fixture) -> Vec<(String, Vec<String>)> {
+    f.store
+        .project_status(f.cwd())
+        .unwrap()
+        .into_iter()
+        .map(|file| (file.relative, file.sessions))
+        .collect()
+}
+
+const LONG: &str = "1\n2\n3\n4\n5\n6\n7\n8\n9\n";
+const TWO_EDITS: &str = "1\nTWO\n3\n4\n5\n6\n7\nEIGHT\n9\n";
+
+#[test]
+fn the_project_review_joins_every_chats_pending_files_against_the_commit() {
+    let f = Fixture::new();
+    f.write("a.txt", "my own edit before any agent\n");
+    agent_turn(&f, "chat1", "t1", || f.write("one.txt", "from chat one\n"));
+    agent_turn(&f, "chat2", "t2", || {
+        f.write("one.txt", "from chat one\nand chat two\n");
+        f.write("two.txt", "from chat two\n");
+    });
+    // Your own edit is not agent work, so it never shows.
+    assert_eq!(
+        project_files(&f),
+        [
+            (
+                "one.txt".to_string(),
+                vec!["chat1".to_string(), "chat2".to_string()]
+            ),
+            ("two.txt".to_string(), vec!["chat2".to_string()]),
+        ]
+    );
+    // Chat two's baseline already had chat one's line; chat one's is the
+    // committed (absent) version, so the review shows every agent line.
+    let diff = f.store.project_file_diff(f.cwd(), "one.txt").unwrap();
+    assert_eq!(diff.status, "added");
+    assert_eq!(diff.original, "");
+    assert_eq!(diff.current, "from chat one\nand chat two\n");
+    // A chat from another checkout never joins.
+    let other = Fixture::new();
+    agent_turn(&other, "chat3", "t3", || {
+        other.write("x.txt", "elsewhere\n")
+    });
+    assert_eq!(project_files(&f).len(), 2);
+}
+
+#[test]
+fn keeping_one_change_leaves_the_others_pending_and_survives_later_turns() {
+    let f = Fixture::new();
+    f.write("long.txt", LONG);
+    run_git(&f.repo, &["add", "long.txt"]).unwrap();
+    run_git(&f.repo, &["commit", "-m", "long"]).unwrap();
+    agent_turn(&f, "chat", "t1", || f.write("long.txt", TWO_EDITS));
+    let diff = f.store.project_file_diff(f.cwd(), "long.txt").unwrap();
+    let kept = crate::diff::stage_chunk(&diff.original, &diff.current, 0).unwrap();
+    f.store
+        .project_keep_part(f.cwd(), "long.txt", &kept)
+        .unwrap();
+    let diff = f.store.project_file_diff(f.cwd(), "long.txt").unwrap();
+    assert_eq!(diff.original, "1\nTWO\n3\n4\n5\n6\n7\n8\n9\n");
+    assert_eq!(diff.current, TWO_EDITS);
+    // The status counts follow the kept baseline.
+    let status = f.store.project_status(f.cwd()).unwrap();
+    assert_eq!((status[0].additions, status[0].deletions), (1, 1));
+    // A later turn that leaves the file alone carries the kept baseline.
+    agent_turn(&f, "chat", "t2", || f.write("other.txt", "more\n"));
+    let diff = f.store.project_file_diff(f.cwd(), "long.txt").unwrap();
+    assert_eq!(diff.original, "1\nTWO\n3\n4\n5\n6\n7\n8\n9\n");
+    // Keeping the last change resolves the file.
+    let kept = crate::diff::stage_chunk(&diff.original, &diff.current, 0).unwrap();
+    f.store
+        .project_keep_part(f.cwd(), "long.txt", &kept)
+        .unwrap();
+    assert_eq!(
+        project_files(&f),
+        [("other.txt".to_string(), vec!["chat".to_string()])]
+    );
+    assert_eq!(
+        std::fs::read_to_string(f.repo.join("long.txt")).unwrap(),
+        TWO_EDITS
+    );
+}
+
+#[test]
+fn undoing_one_change_writes_only_that_change_and_refuses_stale_reviews() {
+    let f = Fixture::new();
+    f.write("long.txt", LONG);
+    run_git(&f.repo, &["add", "long.txt"]).unwrap();
+    run_git(&f.repo, &["commit", "-m", "long"]).unwrap();
+    agent_turn(&f, "chat", "t1", || f.write("long.txt", TWO_EDITS));
+    let diff = f.store.project_file_diff(f.cwd(), "long.txt").unwrap();
+    let back = crate::diff::revert_chunk(&diff.original, &diff.current, 1).unwrap();
+    // A review older than the file must not overwrite newer work.
+    assert!(f
+        .store
+        .project_write(f.cwd(), "long.txt", "something else", Some(&back))
+        .is_err());
+    assert_eq!(
+        std::fs::read_to_string(f.repo.join("long.txt")).unwrap(),
+        TWO_EDITS
+    );
+    f.store
+        .project_write(f.cwd(), "long.txt", &diff.current, Some(&back))
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(f.repo.join("long.txt")).unwrap(),
+        "1\nTWO\n3\n4\n5\n6\n7\n8\n9\n"
+    );
+    assert_eq!(project_files(&f).len(), 1);
+    // Undoing the rest puts the file back and resolves it.
+    let diff = f.store.project_file_diff(f.cwd(), "long.txt").unwrap();
+    f.store
+        .project_undo(f.cwd(), "long.txt", &diff.current)
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(f.repo.join("long.txt")).unwrap(),
+        LONG
+    );
+    assert!(project_files(&f).is_empty());
+}
+
+#[test]
+fn undoing_a_created_file_removes_it_and_keep_all_clears_every_chat() {
+    let f = Fixture::new();
+    agent_turn(&f, "chat1", "t1", || f.write("new.txt", "created\n"));
+    agent_turn(&f, "chat2", "t2", || f.write("b.txt", "also\n"));
+    f.store
+        .project_undo(f.cwd(), "new.txt", "created\n")
+        .unwrap();
+    assert!(!f.repo.join("new.txt").exists());
+    assert_eq!(project_files(&f).len(), 1);
+    f.store.project_keep(f.cwd(), None).unwrap();
+    assert!(project_files(&f).is_empty());
+    assert!(f.repo.join("b.txt").exists());
+}
+
+#[test]
+fn committing_a_file_takes_it_out_of_the_project_review() {
+    let f = Fixture::new();
+    agent_turn(&f, "chat", "t1", || {
+        f.write("a.txt", "agent edit\n");
+        f.write("b.txt", "agent file\n");
+    });
+    assert_eq!(project_files(&f).len(), 2);
+    run_git(&f.repo, &["add", "a.txt"]).unwrap();
+    run_git(&f.repo, &["commit", "-m", "keep a"]).unwrap();
+    assert_eq!(
+        project_files(&f),
+        [("b.txt".to_string(), vec!["chat".to_string()])]
+    );
+}
+
+fn linked_worktree(f: &Fixture, name: &str) -> PathBuf {
+    let path = f.repo.join(".worktrees").join(name);
+    std::fs::write(f.repo.join(".gitignore"), ".worktrees/\n").unwrap();
+    run_git(&f.repo, &["add", ".gitignore"]).unwrap();
+    run_git(&f.repo, &["commit", "-m", "ignore worktrees"]).unwrap();
+    run_git(
+        &f.repo,
+        &["worktree", "add", "-b", name, path.to_str().unwrap()],
+    )
+    .unwrap();
+    std::fs::canonicalize(path).unwrap()
+}
+
+#[test]
+fn edits_in_an_ignored_worktree_join_the_project_review_until_kept_or_committed() {
+    let f = Fixture::new();
+    let tree = linked_worktree(&f, "feature");
+    let file = tree.join("a.txt");
+    let key = ".worktrees/feature/a.txt";
+    std::fs::write(&file, "original\nagent line\n").unwrap();
+    // The chat's folder is the project; the edit lands in the worktree.
+    let own = f
+        .store
+        .project_record_edits(f.cwd(), f.cwd(), &[file.to_str().unwrap().into()])
+        .unwrap();
+    assert!(own.is_empty(), "the turn's recording cannot see this file");
+    let status = f.store.project_status(f.cwd()).unwrap();
+    assert_eq!(status.len(), 1);
+    assert_eq!(status[0].relative, key);
+    let diff = f.store.project_file_diff(f.cwd(), key).unwrap();
+    assert_eq!(diff.relative, key);
+    assert_eq!(diff.original, "original\n");
+    assert_eq!(diff.current, "original\nagent line\n");
+
+    f.store.project_keep(f.cwd(), Some(key)).unwrap();
+    assert!(f.store.project_status(f.cwd()).unwrap().is_empty());
+    // A later agent edit shows only what came after the Keep.
+    std::fs::write(&file, "original\nagent line\nsecond\n").unwrap();
+    f.store
+        .project_record_edits(f.cwd(), f.cwd(), &[file.to_str().unwrap().into()])
+        .unwrap();
+    let diff = f.store.project_file_diff(f.cwd(), key).unwrap();
+    assert_eq!(diff.original, "original\nagent line\n");
+
+    run_git(&tree, &["add", "a.txt"]).unwrap();
+    run_git(&tree, &["commit", "-m", "work"]).unwrap();
+    assert!(f.store.project_status(f.cwd()).unwrap().is_empty());
+}
+
+#[test]
+fn undo_and_partial_keep_work_in_another_checkout() {
+    let f = Fixture::new();
+    let tree = linked_worktree(&f, "feature");
+    std::fs::write(tree.join("long.txt"), LONG).unwrap();
+    run_git(&tree, &["add", "long.txt"]).unwrap();
+    run_git(&tree, &["commit", "-m", "long"]).unwrap();
+    let file = tree.join("long.txt");
+    let key = ".worktrees/feature/long.txt";
+    std::fs::write(&file, TWO_EDITS).unwrap();
+    let paths = [file.to_str().unwrap().to_string()];
+    f.store
+        .project_record_edits(f.cwd(), f.cwd(), &paths)
+        .unwrap();
+    let diff = f.store.project_file_diff(f.cwd(), key).unwrap();
+    let kept = crate::diff::stage_chunk(&diff.original, &diff.current, 0).unwrap();
+    f.store.project_keep_part(f.cwd(), key, &kept).unwrap();
+    let diff = f.store.project_file_diff(f.cwd(), key).unwrap();
+    assert_eq!(diff.original, "1\nTWO\n3\n4\n5\n6\n7\n8\n9\n");
+    assert!(f
+        .store
+        .project_undo(f.cwd(), key, "stale review text")
+        .is_err());
+    f.store.project_undo(f.cwd(), key, &diff.current).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "1\nTWO\n3\n4\n5\n6\n7\n8\n9\n"
+    );
+    assert!(f.store.project_status(f.cwd()).unwrap().is_empty());
+}
+
+#[test]
+fn paths_in_the_project_checkout_stay_with_the_turn_and_strangers_are_ignored() {
+    let f = Fixture::new();
+    let elsewhere = Fixture::new();
+    f.write("a.txt", "edited\n");
+    elsewhere.write("a.txt", "edited\n");
+    let own = f
+        .store
+        .project_record_edits(
+            f.cwd(),
+            f.cwd(),
+            &[
+                "a.txt".into(),
+                elsewhere.repo.join("a.txt").to_str().unwrap().into(),
+            ],
+        )
+        .unwrap();
+    assert_eq!(own, ["a.txt"]);
+    assert!(f.store.project_status(f.cwd()).unwrap().is_empty());
+}
+
+#[test]
+fn a_running_turn_shows_edits_as_they_land_and_keep_moves_its_baseline() {
+    let f = Fixture::new();
+    f.write("long.txt", LONG);
+    run_git(&f.repo, &["add", "long.txt"]).unwrap();
+    run_git(&f.repo, &["commit", "-m", "long"]).unwrap();
+    f.store.begin_turn("chat", f.cwd(), "t1").unwrap();
+    f.write("long.txt", TWO_EDITS);
+    // Nothing shows until the agent reports the edit.
+    assert!(project_files(&f).is_empty());
+    f.store
+        .capture("chat", f.cwd(), &["long.txt".into()])
+        .unwrap();
+    assert_eq!(project_files(&f).len(), 1);
+    let diff = f.store.project_file_diff(f.cwd(), "long.txt").unwrap();
+    assert_eq!(
+        (diff.original.as_str(), diff.current.as_str()),
+        (LONG, TWO_EDITS)
+    );
+
+    let kept = crate::diff::stage_chunk(&diff.original, &diff.current, 0).unwrap();
+    f.store
+        .project_keep_part(f.cwd(), "long.txt", &kept)
+        .unwrap();
+    let diff = f.store.project_file_diff(f.cwd(), "long.txt").unwrap();
+    assert_eq!(diff.original, "1\nTWO\n3\n4\n5\n6\n7\n8\n9\n");
+
+    // What was kept during the turn stays kept in its recorded result.
+    f.store.finish_turn("chat", f.cwd(), "t1").unwrap();
+    let diff = f.store.project_file_diff(f.cwd(), "long.txt").unwrap();
+    assert_eq!(diff.original, "1\nTWO\n3\n4\n5\n6\n7\n8\n9\n");
+
+    f.store.project_keep(f.cwd(), Some("long.txt")).unwrap();
+    assert!(project_files(&f).is_empty());
+}

@@ -29,7 +29,8 @@ const options = {
   }],
 };
 await build(options);
-await build({ ...options, entryPoints: ["format.ts"], outfile: asset.replace("native-editor.js", "native-format.js") });
+// The settings parsers are CommonJS packages, which "neutral" does not resolve by default.
+await build({ ...options, entryPoints: ["format.ts"], mainFields: ["module", "main"], outfile: asset.replace("native-editor.js", "native-format.js") });
 // No DOM, Node or external services are available in the native interpreter.
 const sandbox = vm.createContext({});
 vm.runInContext(await readFile(asset, "utf8"), sandbox);
@@ -46,6 +47,8 @@ if (search.matches.length !== 2 || search.matches[0].insert !== "hello!") throw 
 const formatter = vm.createContext({});
 vm.runInContext(await readFile(asset.replace("native-editor.js", "native-format.js"), "utf8"), formatter);
 if (JSON.parse(await formatter.monocodeFormat("a.json", '{"a":1}', 0)).formatted !== '{ "a": 1 }\n') throw new Error("Format smoke check failed");
+const withSettings = JSON.stringify({ config: { name: ".prettierrc", folder: "/p", text: "singleQuote: true" } });
+if (JSON.parse(await formatter.monocodeFormat("/p/a.ts", 'const a = "x"', 0, withSettings)).formatted !== "const a = 'x';\n") throw new Error("Format settings smoke check failed");
 const paletteBuild = await build({ ...options, entryPoints: [], stdin: { contents: 'import { WORKSPACE_THEMES } from "../../src/features/settings/model/workspaceThemes"; globalThis.palettes = Object.fromEntries(WORKSPACE_THEMES.map(t => [t.id, { dark: { ...t.dark.syntax, heading: t.dark.heading }, light: { ...t.light.syntax, heading: t.light.heading } }]));', resolveDir: here }, write: false });
 const palettes = vm.createContext({});
 vm.runInContext(paletteBuild.outputFiles[0].text, palettes);
@@ -62,6 +65,11 @@ for (const name of ["crelt", "style-mod", "w3c-keyname", "prettier"]) {
   const folder = path.join(here, "node_modules", name);
   const pkg = JSON.parse(await readFile(path.join(folder, "package.json"), "utf8"));
   notices.push(`${pkg.name} ${pkg.version}\n${await readFile(path.join(folder, "LICENSE"), "utf8")}`);
+}
+for (const [name, license] of [["js-yaml", "LICENSE"], ["json5", "LICENSE.md"], ["smol-toml", "LICENSE"], ["ignore", "LICENSE-MIT"], ["picomatch", "LICENSE"]]) {
+  const folder = path.join(here, "node_modules", name);
+  const pkg = JSON.parse(await readFile(path.join(folder, "package.json"), "utf8"));
+  notices.push(`${pkg.name} ${pkg.version}\n${await readFile(path.join(folder, license), "utf8")}`);
 }
 await writeFile(asset.replace(/\.js$/, ".LICENSE.txt"), notices.join("\n\n"));
 console.log(`Built ${path.relative(root, asset)} (${(await readFile(asset)).length} bytes)`);

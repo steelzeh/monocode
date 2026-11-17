@@ -8,6 +8,8 @@ pub use presentation::{
 
 /// The app's own step while a conversation carries over from another model.
 pub const HANDOFF: &str = "providerHandoff";
+/// The app's own line in a forked chat, where the copied history ends.
+pub const FORK: &str = "chatFork";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -49,9 +51,20 @@ impl ToolCall {
     pub fn is_handoff(&self) -> bool {
         self.name == HANDOFF
     }
+    pub fn is_fork(&self) -> bool {
+        self.name == FORK
+    }
+    /// The chat this one was forked from, and when in milliseconds.
+    pub fn fork_origin(&self) -> Option<(String, u64)> {
+        if !self.is_fork() {
+            return None;
+        }
+        let input = serde_json::from_str::<serde_json::Value>(&self.input).ok()?;
+        Some((input["from"].as_str()?.to_owned(), input["at"].as_u64()?))
+    }
     /// Session milestones read as a status line rather than a tool step.
     pub fn is_milestone(&self) -> bool {
-        self.is_compaction() || self.is_handoff()
+        self.is_compaction() || self.is_handoff() || self.is_fork()
     }
     pub fn append_output(&mut self, delta: &str) {
         self.output.push_str(delta);

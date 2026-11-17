@@ -10,6 +10,7 @@ use crate::{
     project_search::{ProjectSearch, SearchEvent},
     right_panel::*,
     theme::*,
+    workspace_folders::{WorkspaceChanged, WorkspaceFolders},
 };
 use gpui::{
     AnyElement, App, ClipboardEntry, ClipboardItem, Context, Entity, EventEmitter, ExternalPaths,
@@ -17,7 +18,10 @@ use gpui::{
     MouseButton, MouseDownEvent, Point, PromptLevel, Role, SharedString, StyleRefinement,
     Subscription, Window, actions, div, list, prelude::*, px, rgb,
 };
-use monocode_core::files::{self, DirEntry, NameIssueKind, Severity};
+use monocode_core::{
+    code_workspace::CodeWorkspace,
+    files::{self, DirEntry, NameIssueKind, Severity},
+};
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
@@ -153,6 +157,12 @@ enum NameMode {
 }
 #[derive(Clone, PartialEq)]
 enum Line {
+    /// One of a VS Code workspace's folders, at the top of the tree.
+    Root {
+        name: String,
+        path: String,
+        open: bool,
+    },
     Note {
         depth: usize,
         text: String,
@@ -185,7 +195,13 @@ struct Saved {
 }
 
 pub(crate) struct Explorer {
+    /// The panel's tab row already names this pane and offers its search.
+    header_hidden: bool,
     git: Entity<ProjectGit>,
+    folders: Entity<WorkspaceFolders>,
+    workspace: Option<CodeWorkspace>,
+    /// Projects whose workspace has been shown, and so have started folded.
+    workspaces_seen: HashSet<String>,
     cwd: String,
     enabled: bool,
     show_excluded: bool,
@@ -239,6 +255,7 @@ impl EventEmitter<OpenSearchMatch> for Explorer {}
 impl Explorer {
     pub(crate) fn new(
         git: Entity<ProjectGit>,
+        folders: Entity<WorkspaceFolders>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -254,6 +271,15 @@ impl Explorer {
         });
         let name_focus = name_input.read(cx).focus_handle(cx);
         let subscriptions = vec![
+            cx.subscribe(&folders, |this, _, _: &WorkspaceChanged, cx| {
+                this.workspace_changed(cx)
+            }),
+            // Other repos' colours follow their status reads too.
+            cx.observe(&folders, |this, _, cx| {
+                if this.enabled {
+                    cx.notify();
+                }
+            }),
             cx.subscribe(&git, |this, _, _: &GitChanged, cx| this.git_changed(cx)),
             cx.observe(&git, |this, _, cx| {
                 // Git colours follow every status read.
@@ -279,7 +305,11 @@ impl Explorer {
             }),
         ];
         Self {
+            header_hidden: false,
             git,
+            folders,
+            workspace: None,
+            workspaces_seen: HashSet::new(),
             cwd: String::new(),
             enabled: false,
             show_excluded: false,
@@ -326,6 +356,15 @@ impl Explorer {
         if let Some(search) = &self.search {
             search.update(cx, |search, cx| search.set_active(enabled, cx));
         }
+    }
+    pub(crate) fn set_header_hidden(&mut self, hidden: bool, cx: &mut Context<Self>) {
+        if self.header_hidden != hidden {
+            self.header_hidden = hidden;
+            cx.notify();
+        }
+    }
+    pub(crate) fn search_open(&self) -> bool {
+        self.search.is_some()
     }
     pub(crate) fn open_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.sync_project(cx);
@@ -382,6 +421,50 @@ impl Explorer {
             // Keep the hidden tree intact; rebuild it when Files is shown.
         }
     }
+    /// The project's workspace file was read, changed or went away.
+    fn workspace_changed(&mut self, cx: &mut Context<Self>) {
+        let folders = self.folders.read(cx);
+        let next = (folders.project() == self.cwd)
+            .then(|| folders.workspace().cloned())
+            .flatten();
+        if next == self.workspace {
+            return;
+        }
+        // VS Code opens a workspace with its folders folded.
+        if next.is_some() && self.workspaces_seen.insert(self.cwd.clone()) {
+            self.expanded.remove(&self.cwd);
+        }
+        self.workspace = next;
+        if let Some(workspace) = self.workspace.clone() {
+            for folder in workspace.folders {
+                if self.expanded.contains(&folder.path) && !self.dirs.contains_key(&folder.path) {
+                    self.read_dir(folder.path, cx);
+                }
+            }
+        }
+        self.rebuild(cx);
+    }
+    fn is_workspace_root(&self, path: &str) -> bool {
+        self.workspace
+            .as_ref()
+            .is_some_and(|workspace| workspace.folders.iter().any(|f| f.path == path))
+    }
+    /// A row that stands for a whole project or workspace folder: it can be
+    /// opened and added to, but never renamed, moved or deleted from here.
+    fn is_tree_root(&self, path: &str) -> bool {
+        path == self.cwd || self.is_workspace_root(path)
+    }
+    fn entry_status(&self, path: &str, is_dir: bool, cx: &App) -> Option<String> {
+        if self.workspace.is_some() {
+            return self.folders.read(cx).status(path, is_dir, cx);
+        }
+        let statuses = &self.git.read(cx).statuses;
+        if is_dir {
+            statuses.dirs.get(path).cloned()
+        } else {
+            statuses.files.get(path).cloned()
+        }
+    }
     fn sync_project(&mut self, cx: &mut Context<Self>) -> bool {
         let root = self.git.read(cx).root.clone();
         if root == self.cwd {
@@ -397,6 +480,7 @@ impl Explorer {
             );
         }
         self.cwd = root.clone();
+        self.workspace = None;
         if let Some(search) = &self.search {
             search.update(cx, |search, cx| search.set_root(root.clone(), cx));
         }
@@ -412,6 +496,7 @@ impl Explorer {
         self.set_operation_error(None, cx);
         self.list.scroll_to(gpui::ListOffset::default());
         self.read_dir(root, cx);
+        self.workspace_changed(cx);
         self.rebuild(cx);
         true
     }
@@ -443,7 +528,11 @@ impl Explorer {
         let mut shown: Vec<String> = self
             .expanded
             .iter()
-            .filter(|p| *p == &self.cwd || self.dirs.contains_key(&parent_of(p)))
+            .filter(|p| {
+                *p == &self.cwd
+                    || self.is_workspace_root(p)
+                    || self.dirs.contains_key(&parent_of(p))
+            })
             .cloned()
             .collect();
         if !shown.contains(&self.cwd) {
@@ -459,7 +548,7 @@ impl Explorer {
             .retain(|k, _| k != path && !k.starts_with(&prefix));
     }
     fn is_dir_at(&self, path: &str) -> bool {
-        if path == self.cwd {
+        if path == self.cwd || self.is_workspace_root(path) {
             return true;
         }
         match self.dirs.get(&parent_of(path)) {
@@ -495,7 +584,20 @@ impl Explorer {
 
     fn rebuild(&mut self, cx: &mut Context<Self>) {
         let mut lines = Vec::new();
-        if self.available() && self.expanded.contains(&self.cwd) {
+        if let Some(workspace) = self.workspace.clone().filter(|_| self.available()) {
+            for folder in workspace.folders {
+                let open = self.expanded.contains(&folder.path);
+                let path = folder.path.clone();
+                lines.push(Line::Root {
+                    name: folder.name,
+                    path: folder.path,
+                    open,
+                });
+                if open {
+                    self.push_children(&path, 1, &mut lines, cx);
+                }
+            }
+        } else if self.available() && self.expanded.contains(&self.cwd) {
             self.push_children(&self.cwd.clone(), 0, &mut lines, cx);
         }
         // Splice only the rows that changed. Replacing the whole range makes
@@ -534,6 +636,8 @@ impl Explorer {
             Some(Ok(entries)) => entries
                 .iter()
                 .filter(|e| self.show_excluded || !e.ignored)
+                // A workspace folder has its own row at the top of the tree.
+                .filter(|e| !self.is_workspace_root(&e.path))
                 .collect(),
             _ => Vec::new(),
         };
@@ -561,6 +665,122 @@ impl Explorer {
         if open {
             self.push_children(&entry.path, depth + 1, lines, cx);
         }
+    }
+    /// A workspace folder: its name from the workspace file, and a dot when
+    /// its repo has changes, as VS Code marks it.
+    fn root_line(
+        &self,
+        ix: usize,
+        name: String,
+        path: String,
+        open: bool,
+        focused: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let selected = self.selected.as_deref() == Some(path.as_str());
+        let over = self.drag_over.as_deref() == Some(path.as_str());
+        let folders = self.folders.read(cx);
+        let changed = folders.repo_changed(&path, cx) || folders.status(&path, true, cx).is_some();
+        let color = changed.then(|| Hsla::from(rgb(AMBER_400)));
+        let (click, menu, drop, drag) = (path.clone(), path.clone(), path.clone(), path.clone());
+        div()
+            .id(("explorer-row", ix))
+            .debug_selector(move || format!("explorer-workspace-root-{ix}"))
+            .role(Role::TreeItem)
+            .aria_label(SharedString::from(name.clone()))
+            .aria_expanded(open)
+            .aria_selected(selected)
+            .h(px(ROW))
+            .w_full()
+            .flex()
+            .items_center()
+            .gap_1()
+            .pl_2()
+            .pr_3()
+            .text_size(px(ENTRY_FONT_SIZE))
+            .line_height(px(ENTRY_FONT_SIZE))
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(content(1.))
+            .when(selected || over, |d| d.bg(selection()))
+            .when(!selected && !over, |d| d.hover(|s| s.bg(content(0.05))))
+            .when(selected && focused && self.keyboard, |d| {
+                d.border_1().border_color(accent_color().opacity(0.4))
+            })
+            .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.keyboard = false;
+                window.focus(&this.focus, cx);
+                this.select(click.clone(), cx);
+                this.toggle(&click, cx);
+            }))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    this.open_menu(
+                        Target {
+                            path: menu.clone(),
+                            is_dir: true,
+                            root: true,
+                        },
+                        event.position,
+                        window,
+                        cx,
+                    );
+                }),
+            )
+            .on_drag_move::<ExternalPaths>(cx.listener(
+                move |this, event: &gpui::DragMoveEvent<ExternalPaths>, _, cx| {
+                    if event.bounds.contains(&event.event.position)
+                        && this.drag_over.as_ref() != Some(&drag)
+                    {
+                        this.drag_over = Some(drag.clone());
+                        cx.notify();
+                    }
+                },
+            ))
+            .on_drop(cx.listener(move |this, paths: &ExternalPaths, window, cx| {
+                this.drag_over = None;
+                this.copy_external(paths.paths().to_vec(), drop.clone(), window, cx);
+            }))
+            .child(
+                div()
+                    .size_4()
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        icon(
+                            if open {
+                                "chevron-down"
+                            } else {
+                                "chevron-right"
+                            },
+                            14.,
+                        )
+                        .text_color(content(0.5)),
+                    ),
+            )
+            .child(
+                div()
+                    .min_w_0()
+                    .flex_1()
+                    .truncate()
+                    .line_height(px(ENTRY_FONT_SIZE * 1.4))
+                    .when_some(color, |d, c| d.text_color(c))
+                    .child(name),
+            )
+            .when(changed, |d| {
+                d.child(
+                    div()
+                        .size(px(6.))
+                        .flex_shrink_0()
+                        .rounded_full()
+                        .bg(rgb(AMBER_400)),
+                )
+            })
+            .into_any_element()
     }
     /// NameRow and its NameIssueView.
     fn push_name(&self, depth: usize, is_dir: bool, lines: &mut Vec<Line>, cx: &App) {
@@ -641,7 +861,11 @@ impl Explorer {
     }
     fn collapse_all(&mut self, cx: &mut Context<Self>) {
         self.naming = None;
-        self.expanded = HashSet::from([self.cwd.clone()]);
+        self.expanded = if self.workspace.is_some() {
+            HashSet::new()
+        } else {
+            HashSet::from([self.cwd.clone()])
+        };
         self.rebuild(cx);
     }
 
@@ -667,7 +891,7 @@ impl Explorer {
         );
     }
     fn start_rename(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
-        if path == self.cwd {
+        if self.is_tree_root(&path) {
             return;
         }
         self.menu = None;
@@ -866,7 +1090,7 @@ impl Explorer {
         .detach();
     }
     fn delete(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
-        if path == self.cwd {
+        if self.is_tree_root(&path) {
             return;
         }
         let is_dir = self.is_dir_at(&path);
@@ -1001,7 +1225,7 @@ impl Explorer {
         );
     }
     fn duplicate(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
-        if path == self.cwd {
+        if self.is_tree_root(&path) {
             return;
         }
         let parent = parent_of(&path);
@@ -1132,8 +1356,12 @@ impl Explorer {
 
     /// The rows keyboard navigation walks: the root, then each entry shown.
     fn nav_rows(&self) -> Vec<(String, bool)> {
-        let mut rows = vec![(self.cwd.clone(), true)];
+        let mut rows = Vec::new();
+        if self.workspace.is_none() {
+            rows.push((self.cwd.clone(), true));
+        }
         rows.extend(self.lines.iter().filter_map(|l| match l {
+            Line::Root { path, .. } => Some((path.clone(), true)),
             Line::Entry { entry, .. } => Some((entry.path.clone(), entry.is_dir)),
             _ => None,
         }));
@@ -1141,11 +1369,11 @@ impl Explorer {
     }
     fn focus_row(&mut self, path: String, cx: &mut Context<Self>) {
         self.keyboard = true;
-        if let Some(ix) = self
-            .lines
-            .iter()
-            .position(|l| matches!(l, Line::Entry { entry, .. } if entry.path == path))
-        {
+        if let Some(ix) = self.lines.iter().position(|l| match l {
+            Line::Root { path: root, .. } => *root == path,
+            Line::Entry { entry, .. } => entry.path == path,
+            _ => false,
+        }) {
             self.list.scroll_to_reveal_item(ix);
         }
         self.select(path, cx);
@@ -1267,9 +1495,9 @@ impl Explorer {
     }
 
     fn line(&self, ix: usize, focused: bool, cx: &mut Context<Self>) -> AnyElement {
-        let statuses = &self.git.read(cx).statuses;
         let pad = |depth: usize| px(28. + depth as f32 * 12.);
         match self.lines[ix].clone() {
+            Line::Root { name, path, open } => self.root_line(ix, name, path, open, focused, cx),
             Line::Note { depth, text } => div()
                 .pl(pad(depth))
                 .pr_2()
@@ -1349,11 +1577,7 @@ impl Explorer {
                     .as_ref()
                     .is_some_and(|c| c.cut && c.path == entry.path);
                 let over = self.drag_over.as_deref() == Some(entry.path.as_str());
-                let status = if entry.is_dir {
-                    statuses.dirs.get(&entry.path)
-                } else {
-                    statuses.files.get(&entry.path)
-                };
+                let status = self.entry_status(&entry.path, entry.is_dir, cx);
                 let git_color: Option<Hsla> = status.and_then(|s| match s.as_str() {
                     "modified" => Some(rgb(AMBER_400).into()),
                     "added" | "untracked" => Some(rgb(DIFF_ADD).into()),
@@ -1497,8 +1721,13 @@ impl Render for Explorer {
                 .child("No project folder")
                 .into_any_element();
         }
-        let root_open = self.expanded.contains(&self.cwd);
-        let name: SharedString = basename(&self.cwd).to_uppercase().into();
+        let workspace_title = self.workspace.as_ref().map(|w| w.title.clone());
+        let is_workspace = workspace_title.is_some();
+        let root_open = is_workspace || self.expanded.contains(&self.cwd);
+        let name: SharedString = match &workspace_title {
+            Some(title) => format!("{} (WORKSPACE)", title.to_uppercase()).into(),
+            None => basename(&self.cwd).to_uppercase().into(),
+        };
         let root_selected = self.drag_over.as_deref() == Some(self.cwd.as_str());
         let focused = self.focus.contains_focused(window, cx);
         let entity = cx.entity();
@@ -1551,7 +1780,7 @@ impl Render for Explorer {
                 let (path, is_dir) = this.current();
                 if is_dir && this.expanded.contains(&path) {
                     this.toggle(&path, cx);
-                } else if path != this.cwd {
+                } else if path != this.cwd && !this.is_workspace_root(&path) {
                     this.focus_row(parent_of(&path), cx);
                 }
             }))
@@ -1576,7 +1805,7 @@ impl Render for Explorer {
             .on_action(cx.listener(|this, action: &CopyEntry, _, cx| {
                 let _ = action;
                 let (path, is_dir) = this.current();
-                if path != this.cwd {
+                if !this.is_tree_root(&path) {
                     this.clip = Some(Clip {
                         cut: false,
                         path,
@@ -1587,7 +1816,7 @@ impl Render for Explorer {
             }))
             .on_action(cx.listener(|this, _: &CutEntry, _, cx| {
                 let (path, is_dir) = this.current();
-                if path != this.cwd {
+                if !this.is_tree_root(&path) {
                     this.clip = Some(Clip {
                         cut: true,
                         path,
@@ -1619,45 +1848,54 @@ impl Render for Explorer {
                     );
                 }),
             )
-            .child(
-                pane_header("explorer-header", "Explorer")
-                    .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
-                    .child(
-                        Self::header_icon("explorer-new-file", "New File".into(), "file-add", true)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.start_create(false, None, window, cx)
-                            })),
-                    )
-                    .child(
-                        Self::header_icon(
-                            "explorer-new-folder",
-                            "New Folder".into(),
-                            "folder-add",
-                            true,
+            .when(!self.header_hidden, |d| {
+                d.child(
+                    pane_header("explorer-header", "Explorer")
+                        .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
+                        .child(
+                            Self::header_icon(
+                                "explorer-new-file",
+                                "New File".into(),
+                                "file-add",
+                                true,
+                            )
+                            .on_click(cx.listener(
+                                |this, _, window, cx| this.start_create(false, None, window, cx),
+                            )),
                         )
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.start_create(true, None, window, cx)
-                        })),
-                    )
-                    .child(
-                        Self::header_icon(
-                            "explorer-collapse",
-                            "Collapse All".into(),
-                            "fold-vertical",
-                            true,
+                        .child(
+                            Self::header_icon(
+                                "explorer-new-folder",
+                                "New Folder".into(),
+                                "folder-add",
+                                true,
+                            )
+                            .on_click(cx.listener(
+                                |this, _, window, cx| this.start_create(true, None, window, cx),
+                            )),
                         )
-                        .on_click(cx.listener(|this, _, _, cx| this.collapse_all(cx))),
-                    )
-                    .child(
-                        Self::header_icon(
-                            "explorer-search",
-                            format!("Search in files ({MOD}Shift+F)").into(),
-                            "search",
-                            true,
+                        .child(
+                            Self::header_icon(
+                                "explorer-collapse",
+                                "Collapse All".into(),
+                                "fold-vertical",
+                                true,
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| this.collapse_all(cx))),
                         )
-                        .on_click(cx.listener(|this, _, window, cx| this.open_search(window, cx))),
-                    ),
-            )
+                        .child(
+                            Self::header_icon(
+                                "explorer-search",
+                                format!("Search in files ({MOD}Shift+F)").into(),
+                                "search",
+                                true,
+                            )
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.open_search(window, cx)),
+                            ),
+                        ),
+                )
+            })
             .child(
                 div()
                     .h(px(32.))
@@ -1681,12 +1919,14 @@ impl Render for Explorer {
                             .on_mouse_down(MouseButton::Left, |_, window, _| {
                                 window.prevent_default()
                             })
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                window.focus(&this.focus, cx);
-                                let cwd = this.cwd.clone();
-                                this.select(cwd.clone(), cx);
-                                this.toggle(&cwd, cx);
-                            }))
+                            .when(!is_workspace, |d| {
+                                d.on_click(cx.listener(|this, _, window, cx| {
+                                    window.focus(&this.focus, cx);
+                                    let cwd = this.cwd.clone();
+                                    this.select(cwd.clone(), cx);
+                                    this.toggle(&cwd, cx);
+                                }))
+                            })
                             .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
                                 this.drag_over = None;
                                 let dest = this.cwd.clone();
@@ -1699,17 +1939,19 @@ impl Render for Explorer {
                                     .flex()
                                     .items_center()
                                     .justify_center()
-                                    .child(
-                                        icon(
-                                            if root_open {
-                                                "chevron-down"
-                                            } else {
-                                                "chevron-right"
-                                            },
-                                            14.,
+                                    .when(!is_workspace, |d| {
+                                        d.child(
+                                            icon(
+                                                if root_open {
+                                                    "chevron-down"
+                                                } else {
+                                                    "chevron-right"
+                                                },
+                                                14.,
+                                            )
+                                            .text_color(content(0.5)),
                                         )
-                                        .text_color(content(0.5)),
-                                    ),
+                                    }),
                             )
                             .child(
                                 div()
@@ -1749,7 +1991,7 @@ impl Render for Explorer {
 
 /// Smallest `old[start..old_end]` -> `new[start..new_end]` replacement that
 /// turns `old` into `new` (common prefix and suffix are left untouched).
-fn changed_range<T: PartialEq>(old: &[T], new: &[T]) -> (usize, usize, usize) {
+pub(crate) fn changed_range<T: PartialEq>(old: &[T], new: &[T]) -> (usize, usize, usize) {
     let start = old.iter().zip(new).take_while(|(a, b)| a == b).count();
     let suffix = old[start..]
         .iter()
@@ -1763,6 +2005,115 @@ fn changed_range<T: PartialEq>(old: &[T], new: &[T]) -> (usize, usize, usize) {
 #[cfg(test)]
 mod changed_range_tests {
     use super::changed_range;
+
+    #[gpui::test]
+    fn a_workspace_file_turns_its_folders_into_the_top_of_the_tree(cx: &mut gpui::TestAppContext) {
+        use super::*;
+        use crate::workspace_changes::test_support::Platform;
+        let platform = Platform::new();
+        let project = platform.path();
+        cx.update(crate::popover::bind);
+        cx.update(crate::input::bind);
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |window, cx| {
+                let git = cx.new(|cx| ProjectGit::new(project.clone(), cx));
+                let folders = cx.new(|cx| WorkspaceFolders::new(git.clone(), cx));
+                cx.new(|cx| {
+                    let mut explorer = Explorer::new(git, folders, window, cx);
+                    explorer.set_enabled(true, cx);
+                    explorer
+                })
+            })
+            .unwrap()
+        });
+        cx.executor().allow_parking();
+        let settle = |cx: &mut gpui::TestAppContext| {
+            for _ in 0..30 {
+                cx.run_until_parked();
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            cx.run_until_parked();
+        };
+        settle(cx);
+        let shown = |explorer: &Explorer| -> Vec<String> {
+            explorer
+                .lines
+                .iter()
+                .filter_map(|line| match line {
+                    Line::Root { name, open, .. } => {
+                        Some(format!("{} {name}", if *open { "open" } else { "shut" }))
+                    }
+                    Line::Entry { entry, depth, .. } => Some(format!("{depth} {}", entry.name)),
+                    _ => None,
+                })
+                .collect()
+        };
+        window
+            .update(cx, |explorer, _, _| {
+                assert_eq!(shown(explorer), ["shut API", "shut Packages", "shut Root"]);
+            })
+            .unwrap();
+        let root = project.clone();
+        window
+            .update(cx, |explorer, _, cx| explorer.toggle(&root, cx))
+            .unwrap();
+        settle(cx);
+        window
+            .update(cx, |explorer, _, _| {
+                let rows = shown(explorer);
+                assert_eq!(
+                    rows[..3],
+                    ["shut API", "shut Packages", "open Root"],
+                    "{rows:?}"
+                );
+                assert!(rows.contains(&"1 config.txt".to_owned()), "{rows:?}");
+                assert!(
+                    !rows
+                        .iter()
+                        .any(|row| row.ends_with(" packages") || row.ends_with(" api")),
+                    "a workspace folder is not listed twice: {rows:?}"
+                );
+            })
+            .unwrap();
+        let api = format!("{project}/api");
+        window
+            .update(cx, |explorer, _, cx| explorer.toggle(&api, cx))
+            .unwrap();
+        settle(cx);
+        let file = format!("{api}/server.ts");
+        window
+            .update(cx, |explorer, _, cx| {
+                let rows = shown(explorer);
+                assert_eq!(rows[..2], ["open API", "1 server.ts"], "{rows:?}");
+                // The nested repo's own status colours its files.
+                assert_eq!(
+                    explorer.entry_status(&file, false, cx).as_deref(),
+                    Some("modified")
+                );
+                explorer.collapse_all(cx);
+                assert_eq!(shown(explorer), ["shut API", "shut Packages", "shut Root"]);
+            })
+            .unwrap();
+        // A folder row stands for the whole folder, so it is protected.
+        let protected = api.clone();
+        window
+            .update(cx, |explorer, window, cx| {
+                explorer.start_rename(protected.clone(), window, cx);
+                assert!(
+                    explorer.naming.is_none(),
+                    "a workspace folder cannot be renamed"
+                );
+                explorer.delete(protected.clone(), window, cx);
+                explorer.duplicate(protected.clone(), window, cx);
+            })
+            .unwrap();
+        settle(cx);
+        assert!(
+            !cx.has_pending_prompt(),
+            "a workspace folder cannot be deleted"
+        );
+        assert!(std::path::Path::new(&api).is_dir());
+    }
 
     #[test]
     fn expanding_a_folder_only_touches_the_inserted_rows() {

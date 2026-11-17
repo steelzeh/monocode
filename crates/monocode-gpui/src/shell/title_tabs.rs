@@ -92,10 +92,7 @@ impl Shell {
                         let id = self.workspace.scope_pane(*tab);
                         self.session_summaries
                             .contains_key(&self.workspace.session_for_pane(id))
-                            && self
-                                .session_metadata(self.workspace.session_for_pane(id), cx)
-                                .summary
-                                .cwd
+                            && self.session_project(self.workspace.session_for_pane(id), cx)
                                 == self.workspace.project
                             && self.in_worktree_scope(id, cx)
                     }

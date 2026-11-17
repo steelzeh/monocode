@@ -77,14 +77,8 @@ impl Store {
         Ok((session, true))
     }
 
-    pub fn app_conversation(
-        &self,
-        id: i64,
-        input: &Value,
-        busy: bool,
-        has_draft: bool,
-    ) -> Result<Value, String> {
-        let blocks = if self.shared.is_some() {
+    fn app_blocks(&self, id: i64) -> Result<Vec<Value>, String> {
+        Ok(if self.shared.is_some() {
             self.shared_blocks(id)?
         } else {
             let mut blocks: Vec<Value> = Vec::new();
@@ -98,7 +92,16 @@ impl Store {
                 }
             }
             blocks
-        };
+        })
+    }
+    pub fn app_conversation(
+        &self,
+        id: i64,
+        input: &Value,
+        busy: bool,
+        has_draft: bool,
+    ) -> Result<Value, String> {
+        let blocks = self.app_blocks(id)?;
         let mut page = crate::app_access::conversation_page(&blocks, input)?;
         page["sessionId"] = json!(id);
         page["busy"] = json!(busy);

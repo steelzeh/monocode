@@ -39,7 +39,7 @@ fn call(
                     request_id: request.into(),
                     action: action.into(),
                     input,
-                    reply,
+                    reply: reply.into(),
                 },
                 window,
                 cx,
@@ -91,7 +91,7 @@ fn submitted_operator_access_survives_the_composer_reset(cx: &mut TestAppContext
                         request_id: "after-submit".into(),
                         action: "sessions.list".into(),
                         input: json!({}),
-                        reply,
+                        reply: reply.into(),
                     },
                     cx,
                 )
@@ -664,4 +664,184 @@ fn app_launch_submission_uses_the_saved_message_identity(cx: &mut TestAppContext
             shell.sessions[&child].update(cx, |v, _| v.busy = false);
         })
         .unwrap();
+}
+
+#[gpui::test]
+fn every_chat_names_only_itself_and_operator_names_others(cx: &mut TestAppContext) {
+    let (window, plain, operator) = setup(cx);
+    // A chat without Operator reads and renames itself.
+    let read = call(window, plain, "t1", "sessions.title", json!({}), cx).unwrap();
+    assert_eq!(read["sessionId"], plain);
+    let renamed = call(
+        window,
+        plain,
+        "t2",
+        "sessions.rename",
+        json!({"title": "Project folders sidebar"}),
+        cx,
+    )
+    .unwrap();
+    assert_eq!(renamed["title"], "Project folders sidebar");
+    window
+        .update(cx, |shell, _, cx| {
+            assert_eq!(
+                shell.session_metadata(plain, cx).summary.title,
+                "Project folders sidebar"
+            );
+        })
+        .unwrap();
+    // It cannot reach another chat, or the wider project actions.
+    let other = call(
+        window,
+        plain,
+        "t3",
+        "sessions.rename",
+        json!({"sessionId": operator, "title": "Taken"}),
+        cx,
+    )
+    .unwrap_err();
+    assert!(other.contains("own title"), "{other}");
+    assert!(call(window, plain, "t4", "sessions.list", json!({}), cx).is_err());
+    let empty = call(
+        window,
+        plain,
+        "t5",
+        "sessions.rename",
+        json!({"title": " "}),
+        cx,
+    );
+    assert!(empty.unwrap_err().contains("title"));
+    // An Operator thread names other sessions in its project, and no others.
+    let outside = call(
+        window,
+        operator,
+        "t6",
+        "sessions.rename",
+        json!({"sessionId": plain, "title": "Taken"}),
+        cx,
+    );
+    assert!(outside.unwrap_err().contains("outside this project"));
+    let child = launch(
+        window,
+        operator,
+        "t7",
+        json!({"prompt": "Fix renaming", "draft": true}),
+        cx,
+    );
+    let named = call(
+        window,
+        operator,
+        "t8",
+        "sessions.rename",
+        json!({"sessionId": child, "title": "#646 Rename sessions"}),
+        cx,
+    )
+    .unwrap();
+    assert_eq!(named["sessionId"], child);
+    let read = call(
+        window,
+        operator,
+        "t9",
+        "sessions.title",
+        json!({"sessionId": child}),
+        cx,
+    )
+    .unwrap();
+    assert_eq!(read["title"], "#646 Rename sessions");
+}
+
+#[gpui::test]
+fn linked_chats_read_and_message_each_other_without_operator(cx: &mut TestAppContext) {
+    // The two chats are in different projects, and neither has Operator.
+    let (window, other, chat) = crate::shell::tests::window(cx);
+    let send = |from: i64, to: i64, request: &str, cx: &mut TestAppContext| {
+        call(
+            window,
+            from,
+            request,
+            "sessions.send",
+            json!({"sessionId": to, "prompt": "Run the tests"}),
+            cx,
+        )
+    };
+    let read = |from: i64, to: i64, request: &str, cx: &mut TestAppContext| {
+        call(
+            window,
+            from,
+            request,
+            "sessions.read",
+            json!({"sessionId": to}),
+            cx,
+        )
+    };
+    let refused = send(chat, other, "l1", cx).unwrap_err();
+    assert!(refused.contains("not linked"), "{refused}");
+    assert!(read(chat, other, "l2", cx).is_err());
+    window
+        .update(cx, |shell, _, cx| {
+            locked(&shell.store)
+                .unwrap()
+                .link_chats(chat, other)
+                .unwrap();
+            // Save the turn, then fail without starting a real provider.
+            for id in [chat, other] {
+                shell
+                    .ensure_session(id, cx)
+                    .unwrap()
+                    .update(cx, |view, _| view.summary.provider = "fixture".into());
+            }
+        })
+        .unwrap();
+    assert!(read(chat, other, "l3", cx).is_ok());
+    let sent = send(chat, other, "l4", cx).unwrap();
+    assert_eq!(sent["sessionId"], other);
+    assert_eq!(sent["submitted"], true);
+    assert_eq!(sent["queued"], false);
+    assert!(
+        sent["title"]
+            .as_str()
+            .is_some_and(|title| !title.is_empty())
+    );
+    window
+        .update(cx, |shell, _, cx| {
+            // The other chat shows who wrote, after the history it had.
+            let rows = shell.sessions[&other].read(cx).mono_rows(cx);
+            assert!(rows.iter().any(|row| {
+                row.role == "user"
+                    && row.text.starts_with("Message from chat \"")
+                    && row.text.ends_with("\n\nRun the tests")
+            }));
+        })
+        .unwrap();
+    // The link goes both ways, so the other agent can answer.
+    assert_eq!(send(other, chat, "l5", cx).unwrap()["sessionId"], chat);
+    // A link gives no other power over the chat.
+    for action in ["sessions.stop", "sessions.archive", "sessions.delete"] {
+        assert!(
+            call(
+                window,
+                chat,
+                &format!("l6-{action}").replace('.', "-"),
+                action,
+                json!({"sessionId": other}),
+                cx
+            )
+            .is_err()
+        );
+    }
+    assert!(call(window, chat, "l7", "sessions.list", json!({}), cx).is_err());
+    // A read-only chat reads its partner, but starts no work there.
+    window
+        .update(cx, |shell, _, cx| {
+            shell.sessions[&chat].update(cx, |view, _| {
+                view.settings.access = monocode_core::agent::AccessMode::ReadOnly
+            });
+        })
+        .unwrap();
+    assert!(
+        send(chat, other, "l8", cx)
+            .unwrap_err()
+            .contains("read-only")
+    );
+    assert!(read(chat, other, "l9", cx).is_ok());
 }

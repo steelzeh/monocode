@@ -321,6 +321,25 @@ impl SettingsView {
                 )],
             ),
         ];
+        if inset && !self.ctx.new_layout_boxy {
+            layout.push(self.row(
+                Some("swap-side-panels"),
+                false,
+                "Swap side panels",
+                Some(
+                    "Put Explorer, History and open files on the left, and the sidebar on the right."
+                        .into(),
+                ),
+                vec![self.toggle(
+                    "swap-side-panels",
+                    "Swap side panels",
+                    p.swap_side_panels,
+                    false,
+                    cx,
+                    |this, on, cx| this.update(cx, |p| p.swap_side_panels = on),
+                )],
+            ));
+        }
         if inset {
             layout.insert(
                 1,

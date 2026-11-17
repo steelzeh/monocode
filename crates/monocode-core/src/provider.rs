@@ -53,6 +53,10 @@ mod questions;
 mod rewind;
 mod tasks;
 pub use rewind::{rewind_last_turn, supports_rewind, RewindError};
+/// Agents whose CLI can copy a saved session into a new one.
+pub fn supports_fork(kind: Kind) -> bool {
+    matches!(kind, Kind::Claude | Kind::Codex)
+}
 #[cfg(all(test, unix))]
 mod text_tests;
 pub use kind::Kind;
@@ -239,6 +243,22 @@ fn executable(path: &Path) -> bool {
 
 /// On resume, Claude Code replays a background-task notification from the
 /// earlier session and answers it with an empty result before the real turn.
+/// Claude's session flags: resume the saved session, or start `new`, as a fork
+/// of `fork` when the chat was forked from another one.
+fn claude_session_args<'a>(
+    saved: Option<&'a str>,
+    new: Option<&'a str>,
+    fork: Option<&'a str>,
+) -> Vec<&'a str> {
+    match (saved, new, fork) {
+        (Some(saved), _, _) => vec!["--resume", saved],
+        (None, Some(new), Some(fork)) => {
+            vec!["--resume", fork, "--fork-session", "--session-id", new]
+        }
+        (None, Some(new), None) => vec!["--session-id", new],
+        (None, None, _) => Vec::new(),
+    }
+}
 fn claude_turn_result(value: &Value) -> bool {
     value["type"] == "result"
         && !(value["origin"]["kind"] == "task-notification" && value["num_turns"] == 0)
@@ -555,6 +575,10 @@ impl Protocol {
                             // provider context without serializing its history.
                             params["excludeTurns"] = true.into();
                             "thread/resume"
+                        } else if let Some(source) = &self.request.settings.fork_from {
+                            params["threadId"] = source.clone().into();
+                            params["excludeTurns"] = true.into();
+                            "thread/fork"
                         } else {
                             "thread/start"
                         };
@@ -598,6 +622,7 @@ impl Protocol {
                             if self.request.settings.operator
                                 || self.request.settings.operator_enabled
                                 || self.request.settings.orchestrator
+                                || self.request.settings.chat_links
                             {
                                 params["sandboxPolicy"]["networkAccess"] = true.into();
                             }
@@ -1418,6 +1443,13 @@ fn run_operation(
                 request.settings.mono.as_ref(),
                 &request.settings.environment,
             );
+            if !request.settings.text_only {
+                crate::mono::bridge::configure_codex_chat(
+                    &mut command,
+                    request.settings.mono.as_ref(),
+                    &request.settings.environment,
+                );
+            }
             if let Some(mono) = &request.settings.mono {
                 if let Some(home) =
                     crate::mono::codex_home(&mono.root, &request.settings.account.id)?
@@ -1477,6 +1509,18 @@ fn run_operation(
             if let Some(server) = app_server {
                 servers.insert(crate::mono::bridge::MCP_SERVER.into(), server);
                 allowed.push(crate::mono::bridge::CLAUDE_ALLOWED_TOOLS);
+            }
+            if let Some(server) = (!settings.text_only)
+                .then(|| {
+                    crate::mono::bridge::chat_mcp_server(
+                        settings.mono.as_ref(),
+                        &settings.environment,
+                    )
+                })
+                .flatten()
+            {
+                servers.insert(crate::mono::bridge::CHAT_MCP_SERVER.into(), server);
+                allowed.push(crate::mono::bridge::CLAUDE_CHAT_ALLOWED_TOOLS);
             }
             let mut system = Vec::new();
             if let Some(mono) = settings.mono.as_ref().filter(|_| !settings.text_only) {
@@ -1544,11 +1588,11 @@ fn run_operation(
             if !settings.text_only {
                 command.arg("--setting-sources=user,project,local");
             }
-            if let Some(id) = &request.provider_id {
-                command.args(["--resume", id]);
-            } else if let Some(id) = &claude_new_session {
-                command.args(["--session-id", id]);
-            }
+            command.args(claude_session_args(
+                request.provider_id.as_deref(),
+                claude_new_session.as_deref(),
+                request.settings.fork_from.as_deref(),
+            ));
             if let Some(model) = &request.model {
                 let model = if settings
                     .model_settings
@@ -1607,7 +1651,11 @@ fn run_operation(
     let mut pending = Vec::new();
     if let Some(id) = claude_new_session {
         protocol.request.provider_id = Some(id.clone());
-        pending.push(Event::SessionId(id));
+        // A fork is only bound once Claude reports it, so a failed fork keeps
+        // its source and the next turn tries again.
+        if protocol.request.settings.fork_from.is_none() {
+            pending.push(Event::SessionId(id));
+        }
     }
     let mut stop_confirmed = false;
     let result = (|| {
@@ -1954,6 +2002,13 @@ mod tests {
         }
     }
     #[test]
+    fn a_linked_chat_keeps_the_codex_app_bridge_reachable() {
+        let mut p = protocol(Kind::Codex);
+        assert!(p.codex_access().2["networkAccess"] != true);
+        p.request.settings.chat_links = true;
+        assert_eq!(p.codex_access().2["networkAccess"], true);
+    }
+    #[test]
     fn context_reports_use_the_latest_request_and_include_cached_tokens() {
         let mut codex = protocol(Kind::Codex);
         let events = codex.frame(json!({"method":"thread/tokenUsage/updated","params":{"tokenUsage":{"last":{"totalTokens":4200},"total":{"totalTokens":99000},"modelContextWindow":272000}}}),&mut Vec::new()).unwrap();
@@ -2004,6 +2059,58 @@ mod tests {
         assert!(claude.claude_usage_limit.is_none());
         let error = claude.frame(json!({"type":"result","is_error":true,"num_turns":1,"result":"Something else went wrong"}), &mut Vec::new()).unwrap_err();
         assert_eq!(error, "Something else went wrong");
+    }
+    #[test]
+    fn claude_forks_only_a_chat_without_its_own_session() {
+        assert_eq!(
+            claude_session_args(None, Some("new"), Some("source")),
+            [
+                "--resume",
+                "source",
+                "--fork-session",
+                "--session-id",
+                "new"
+            ]
+        );
+        // Once the fork is bound, later turns resume the fork itself.
+        assert_eq!(
+            claude_session_args(Some("new"), None, Some("source")),
+            ["--resume", "new"]
+        );
+        assert_eq!(
+            claude_session_args(None, Some("new"), None),
+            ["--session-id", "new"]
+        );
+    }
+    #[test]
+    fn codex_forks_a_new_chat_from_its_source_thread() {
+        let mut p = protocol(Kind::Codex);
+        p.request.settings.fork_from = Some("source".into());
+        let mut out = Vec::new();
+        p.frame(json!({"id":1,"result":{}}), &mut out).unwrap();
+        let fork: Value = String::from_utf8_lossy(&out)
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .find(|message| message["id"] == 2)
+            .unwrap();
+        assert_eq!(fork["method"], "thread/fork");
+        assert_eq!(fork["params"]["threadId"], "source");
+        assert_eq!(fork["params"]["excludeTurns"], true);
+        let events = p
+            .frame(
+                json!({"id":2,"result":{"thread":{"id":"forked"}}}),
+                &mut out,
+            )
+            .unwrap();
+        assert!(events.contains(&Event::SessionId("forked".into())));
+        // A saved thread always resumes, even if the fork marker lingers.
+        let mut p = protocol(Kind::Codex);
+        p.request.provider_id = Some("forked".into());
+        p.request.settings.fork_from = Some("source".into());
+        let mut out = Vec::new();
+        p.frame(json!({"id":1,"result":{}}), &mut out).unwrap();
+        assert!(String::from_utf8_lossy(&out).contains("thread/resume"));
+        assert!(!String::from_utf8_lossy(&out).contains("thread/fork"));
     }
     #[test]
     fn codex_handshake_stream_snapshot_and_resume() {

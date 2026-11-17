@@ -16,7 +16,9 @@ mod outline;
 mod perf_scroll;
 pub(crate) mod phases;
 mod provider_switch;
+pub(crate) mod question_box;
 mod remote_plans;
+mod thinking_notes;
 pub(crate) mod selection;
 pub(crate) mod tasks;
 mod tools;
@@ -95,6 +97,31 @@ pub(crate) enum MonoResponseAction {
 }
 impl gpui::EventEmitter<MonoResponseAction> for TranscriptView {}
 
+/// The messages written right before the agent asked the user something.
+/// They explain the question, so they stay out of the turn's work fold.
+fn notes_before_questions(rows: &[Row], turn: usize, end: usize) -> HashSet<usize> {
+    let is_question = |row: &Row| {
+        row.role == "tool"
+            && row.text.contains("AskUserQuestion")
+            && serde_json::from_str::<ToolCall>(&row.text)
+                .is_ok_and(|call| call.name == "AskUserQuestion")
+    };
+    let invisible = |row: &Row| {
+        row.role == "reasoning" || (row.role == "assistant" && row.text.trim().is_empty())
+    };
+    (turn..end)
+        .filter(|&at| is_question(&rows[at]))
+        .filter_map(|question| (turn..question).rev().find(|&at| !invisible(&rows[at])))
+        .filter(|&note| rows[note].role == "assistant")
+        .map(|note| {
+            (turn..=note)
+                .rev()
+                .find(|&at| rows[at].first)
+                .unwrap_or(note)
+        })
+        .collect()
+}
+
 fn work_title(model: Option<&str>, elapsed_ms: Option<u64>, live: bool) -> String {
     let model = model.map(str::trim).filter(|model| !model.is_empty());
     let verb = match (live, model.is_some()) {
@@ -150,6 +177,8 @@ enum Body {
     Visual(Arc<monocode_core::visual::VisualDocument>),
     Plain(SharedString),
     Interjection(monocode_core::transcript::Interjection),
+    /// A question the agent asked, with the reply to each part.
+    QuestionAnswers(Arc<[question_box::Entry]>),
     MonoCard(serde_json::Value),
     /// A queued message's bubble, by its index in `pending`.
     Pending(usize),
@@ -761,6 +790,8 @@ pub(crate) struct TranscriptView {
     clamped_prompts: HashSet<usize>,
     phases: HashMap<usize, bool>,
     phase_toggle: Option<usize>,
+    /// Questions still waiting for an answer after the app was reopened.
+    open_questions: HashSet<String>,
     phase_layouts: HashMap<usize, PhaseLayout>,
     phase_scrolls: HashMap<usize, live_phase::LiveScroll>,
     windowed_phases: HashSet<usize>,
@@ -805,6 +836,13 @@ pub(crate) struct TranscriptView {
     rebuild_passes: usize,
 }
 impl TranscriptView {
+    pub(crate) fn set_open_questions(&mut self, prompts: HashSet<String>, cx: &mut Context<Self>) {
+        if self.open_questions != prompts {
+            self.open_questions = prompts;
+            self.rebuild(0, cx);
+        }
+    }
+
     pub(crate) fn side_question(&mut self) {
         self.side_question = true;
     }
@@ -2531,6 +2569,7 @@ impl TranscriptView {
             clamped_prompts: HashSet::new(),
             phases: HashMap::new(),
             phase_toggle: None,
+            open_questions: HashSet::new(),
             phase_layouts: HashMap::new(),
             phase_scrolls: HashMap::new(),
             windowed_phases: HashSet::new(),
@@ -2884,6 +2923,13 @@ impl TranscriptView {
         self.patch_view(self.source.len(), submitted.rows, cx);
     }
 
+    /// Claude chats only: Codex and other agents write their own messages.
+    fn promote_thinking_notes(&mut self, from: usize) -> usize {
+        if self.provider != "claude" {
+            return from;
+        }
+        thinking_notes::promote_notes(&mut self.source, from)
+    }
     /// Patch the store's window from `start`, a row of `source_rows`.
     pub(crate) fn patch(&mut self, start: usize, rows: Vec<Row>, cx: &mut Context<Self>) {
         self.patch_view(self.base + start, rows, cx);
@@ -2911,6 +2957,7 @@ impl TranscriptView {
             }
             self.source_bytes = self.source_bytes.saturating_add(bytes);
         }
+        let start = start.min(self.promote_thinking_notes(start));
         self.visuals.retain(|&start, _| {
             self.source
                 .get(start)
@@ -3248,6 +3295,7 @@ impl TranscriptView {
         let mut turn = 0;
         let mut turn_end = 0;
         let mut final_answer = None;
+        let mut question_notes = HashSet::new();
         let mut awaiting_answer = None;
         let mut has_work = false;
         let mut ready = false;
@@ -3297,6 +3345,7 @@ impl TranscriptView {
                 turn_end = (turn..self.source.len())
                     .find(|&i| self.source[i].is_prompt())
                     .unwrap_or(self.source.len());
+                question_notes = notes_before_questions(&self.source, turn, turn_end);
                 awaiting_answer = (turn..turn_end)
                     .rev()
                     .find(|&i| self.source[i].role == "assistant" && self.source[i].first)
@@ -3320,6 +3369,7 @@ impl TranscriptView {
             let folded = self.fold_work
                 && !is_prompt
                 && !activity.pinned.contains(&at)
+                && !question_notes.contains(&at)
                 && has_work
                 && ready
                 && final_answer.is_some_and(|answer| at < answer)
@@ -3558,6 +3608,27 @@ impl TranscriptView {
                 }
                 // WorkFoldLine puts earlier commentary and work behind its receipt.
             } else if role == "tool"
+                && let Ok(call) = serde_json::from_str::<ToolCall>(&text)
+                && question_box::is_question(&call)
+            {
+                let live = self.streaming && turn_end == self.source.len();
+                let entries = question_box::entries(
+                    &call,
+                    &self.source[at + 1..],
+                    &self.open_questions,
+                    live,
+                );
+                self.rows.push(UiRow {
+                    key: (0, 0),
+                    body: Body::QuestionAnswers(entries.into()),
+                    message,
+                    first: false,
+                    last: false,
+                    work: false,
+                    work_tail: false,
+                    thought_phase: None,
+                });
+            } else if role == "tool"
                 && let Ok(tool) = serde_json::from_str::<ToolCall>(&text)
             {
                 self.rows.push(UiRow {
@@ -3723,6 +3794,7 @@ impl TranscriptView {
                     && ready
                     && role != "visual"
                     && !activity.pinned.contains(&at)
+                    && !question_notes.contains(&at)
                     && final_answer.is_some_and(|answer| at < answer)
                     && !matches!(row.body, Body::WorkLine { .. });
             }
@@ -4793,6 +4865,7 @@ impl TranscriptView {
             Body::GitAction(card) => self.git_card_row(&card, message_start, cx),
             Body::RemotePlan(plan) => self.remote_plan_card(&plan, cx),
             Body::Visual(document) => self.visual_row(message_start, document, cx),
+            Body::QuestionAnswers(ref entries) => question_box::render(entries),
             Body::Interjection(ref note) => {
                 let open = self.expanded.contains(&message_start);
                 let long = note.text.lines().count() > 4 || note.text.len() > 300;
@@ -6497,6 +6570,98 @@ mod scroll_tests {
                 .sum();
             assert!((visible - layout.height * progress).abs() < 0.001);
         }
+    }
+
+    #[gpui::test]
+    fn an_answered_question_leaves_a_box_outside_the_work_fold(cx: &mut TestAppContext) {
+        let view = cx.new(|_| TranscriptView::new());
+        let mut read = ToolCall::new("read", "Read");
+        read.state = ToolState::Completed;
+        let mut asked = ToolCall::new("ask", "AskUserQuestion");
+        asked.state = ToolState::Completed;
+        asked.input = serde_json::json!({"questions": [{"question": "Which one?"}]}).to_string();
+        asked.output = "Your questions have been answered: \"Which one?\"=\"Left\". \
+            You can now continue with these answers in mind."
+            .into();
+        view.update(cx, |view, cx| {
+            view.patch(
+                0,
+                vec![
+                    row("user", "Pick for me"),
+                    row("tool", &serde_json::to_string(&read).unwrap()),
+                    row("tool", &serde_json::to_string(&asked).unwrap()),
+                    row("assistant", "Done."),
+                ],
+                cx,
+            );
+            settle(view, cx);
+            view.rebuild(0, cx);
+            let boxes: Vec<_> = view
+                .rows
+                .iter()
+                .filter_map(|row| match &row.body {
+                    Body::QuestionAnswers(entries) => Some((entries.clone(), row.work)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(boxes.len(), 1);
+            assert!(!boxes[0].1, "it is not part of the folded work");
+            assert_eq!(boxes[0].0[0].title, "Which one?");
+            assert_eq!(
+                boxes[0].0[0].reply,
+                question_box::Reply::Answer("Left".into())
+            );
+            assert!(
+                !view
+                    .rows
+                    .iter()
+                    .any(|row| matches!(row.body, Body::Tool { .. })),
+                "the raw tool row is gone, and the other work is folded"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn a_message_before_a_question_stays_out_of_the_work_fold(cx: &mut TestAppContext) {
+        let view = cx.new(|_| TranscriptView::new());
+        let call = |name: &str| {
+            let mut call = ToolCall::new(name, name);
+            call.state = ToolState::Completed;
+            row("tool", &serde_json::to_string(&call).unwrap())
+        };
+        view.update(cx, |view, cx| {
+            view.patch(
+                0,
+                vec![
+                    row("user", "Why is the sound weak?"),
+                    call("Read"),
+                    row("assistant", "The microphones are fine. Here is why."),
+                    call("AskUserQuestion"),
+                    call("Edit"),
+                    row("assistant", "I made the change."),
+                ],
+                cx,
+            );
+            settle(view, cx);
+            view.rebuild(0, cx);
+            let shown = |view: &TranscriptView, at: usize| {
+                view.rows
+                    .iter()
+                    .filter(|row| !matches!(row.body, Body::WorkLine { .. }))
+                    .any(|row| row.key.0 == at)
+            };
+            assert!(shown(view, 2), "the explanation stays readable");
+            assert!(
+                view.rows
+                    .iter()
+                    .filter(|row| row.key.0 == 2)
+                    .all(|row| !row.work),
+                "and lays out as a normal message"
+            );
+            assert!(shown(view, 5), "the final answer shows too");
+            assert!(!shown(view, 1), "the work before it still folds");
+            assert!(!shown(view, 4), "and so does the work after it");
+        });
     }
 
     #[gpui::test]
